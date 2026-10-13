@@ -1,0 +1,461 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { analyze, type Analysis } from '../engine/analysis';
+import { MODES, paramsFor, type ModeId, type Params } from '../engine/presets';
+import { finish, srKey, superResolve, type Box, type EngineKind, type Progress, type Runtime } from '../engine/pipeline';
+import { Cancelled } from '../engine/upscale';
+import { allowedScales, MAX_INPUT_PIXELS, type Scale } from '../engine/tiling';
+import { validateDimensions, validateUpload, MAX_FILE_BYTES } from '../engine/validate';
+import { decodeFile, encode, imgToCanvas, probeServer, serverUpscale, supportsWebpEncode, type ExportFormat } from '../engine/io';
+import { detectFaces, initRuntime, type RuntimeInfo } from '../engine/runtime';
+import { resample, type Img } from '../engine/ops';
+import { Viewer, type ViewMode, type ZoomCmd } from './Viewer';
+import { exportSizes, formatBytes } from './viewMath';
+import { makeSample } from './sample';
+import { saveFile } from './save';
+
+interface Source { img: Img; canvas: HTMLCanvasElement; name: string; bytes: number; format: string; sample: boolean }
+interface Done { canvas: HTMLCanvasElement; img: Img; engine: EngineKind; notes: string[]; ms: number; params: Params; srKey: string }
+type RtState = { status: 'loading' } | { status: 'ready'; rt: Runtime; info: RuntimeInfo } | { status: 'failed'; info: RuntimeInfo };
+
+const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+const pct = (v: number) => `${Math.round(v * 100)}%`;
+
+export function App() {
+  const [src, setSrc] = useState<Source | null>(null);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [faces, setFaces] = useState<Box[] | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [mode, setMode] = useState<ModeId>('auto');
+  const [params, setParams] = useState<Params>(paramsFor('auto', null, 4));
+  const [engine, setEngine] = useState<EngineKind>('ai');
+  const [rt, setRt] = useState<RtState>({ status: 'loading' });
+  const [server, setServer] = useState<{ faceModel: boolean; model: string } | null>(null);
+  const [genFace, setGenFace] = useState(false);
+  const [done, setDone] = useState<Done | null>(null);
+  const [job, setJob] = useState<Progress | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>('slider');
+  const [frac, setFrac] = useState(0.5);
+  const [cmd, setCmd] = useState<ZoomCmd>({ kind: 'fit', n: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [dragging, setDragging] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const srCache = useRef<{ key: string; img: Img; notes: string[]; src: Source } | null>(null);
+  const abort = useRef<AbortController | null>(null);
+  const rtPromise = useRef<Promise<RtState> | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  /* ---------- runtime ---------- */
+  useEffect(() => {
+    rtPromise.current = initRuntime().then(({ rt, info }) => {
+      const s: RtState = rt ? { status: 'ready', rt, info } : { status: 'failed', info };
+      setRt(s);
+      if (!rt) setEngine((e) => (e === 'ai' ? 'classic' : e));
+      return s;
+    });
+    probeServer().then((s) => { if (s) setServer(s); });
+    makeSample().then((b) => loadBlob(b, 'sample-north-pier.jpg', true)).catch(() => {});
+    const onPaste = (e: ClipboardEvent) => {
+      const f = [...(e.clipboardData?.files ?? [])].find((x) => x.type.startsWith('image/'));
+      if (f) { e.preventDefault(); loadBlob(f, f.name || 'pasted-image.png'); }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, []);
+
+  /* ---------- loading ---------- */
+  const clearAll = useCallback(() => {
+    abort.current?.abort();
+    srCache.current = null;
+    setSrc(null); setAnalysis(null); setFaces(null); setDone(null); setJob(null); setError(null);
+    if (fileInput.current) fileInput.current.value = '';
+  }, []);
+
+  const loadBlob = useCallback(async (blob: Blob, name: string, sample = false) => {
+    setError(null);
+    const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+    const v = validateUpload(blob.size, head);
+    if (!v.ok) { setError(v.error); return; }
+    let decoded;
+    try { decoded = await decodeFile(blob); } catch (e) { setError((e as Error).message); return; }
+    const dimErr = validateDimensions(decoded.img.w, decoded.img.h, MAX_INPUT_PIXELS);
+    if (dimErr) { setError(dimErr); return; }
+    abort.current?.abort();
+    srCache.current = null;
+    const s: Source = { ...decoded, name, bytes: blob.size, format: v.format, sample };
+    setSrc(s); setDone(null); setJob(null); setFaces(null); setAnalysis(null); setAnalyzing(true);
+    setFrac(0.5); setCmd((c) => ({ kind: 'fit', n: c.n + 1 }));
+    // first pass without faces so the summary appears immediately
+    const a0 = analyze(s.img, s.bytes, s.format, null);
+    setAnalysis(a0);
+    setMode('auto'); setParams(paramsFor('auto', a0, a0.recommendedScale));
+    const state = await rtPromise.current;
+    let boxes: Box[] | null = null;
+    if (state?.status === 'ready') boxes = await detectFaces(s.canvas);
+    const a1 = analyze(s.img, s.bytes, s.format, boxes ? boxes.length : null);
+    setFaces(boxes); setAnalysis(a1); setAnalyzing(false);
+    setParams(paramsFor('auto', a1, a1.recommendedScale));
+  }, []);
+
+  const pickFile = (f: File | undefined) => { if (f) loadBlob(f, f.name); };
+
+  /* ---------- enhancement ---------- */
+  const scales = src ? allowedScales(src.img.w, src.img.h) : ([2, 4, 8] as Scale[]);
+  const faceList = faces ?? [];
+  const key = src ? srKey(params, engine, faceList) : '';
+  const dirty = !done || JSON.stringify(done.params) !== JSON.stringify(params) || done.engine !== engine;
+  const fastApply = !!done && srCache.current?.key === key && srCache.current.src === src;
+
+  const run = async () => {
+    if (!src) return;
+    abort.current?.abort();
+    const ctl = new AbortController(); abort.current = ctl;
+    setError(null);
+    const prog = (p: Progress) => setJob(p);
+    try {
+      let runtime: Runtime | null = null;
+      if (engine === 'ai') {
+        setJob({ stage: 'Loading AI model' });
+        const s = await rtPromise.current;
+        if (s?.status !== 'ready') throw new Error(`The AI engine could not start${s?.status === 'failed' && s.info.error ? `: ${s.info.error}` : ''}. Switch to Conventional to continue.`);
+        runtime = s.rt;
+      }
+      let sr = srCache.current;
+      if (!sr || sr.key !== key || sr.src !== src) {
+        const r = await superResolve(src.img, faceList, params, engine, runtime, prog, ctl.signal,
+          (img, p, sig) => serverUpscale(img, p, sig, genFace));
+        sr = { key, img: r.img, notes: r.notes, src };
+        srCache.current = sr;
+      }
+      const t0 = performance.now();
+      const img = await finish(src.img, sr.img, faceList, params, engine, prog, ctl.signal);
+      const canvas = imgToCanvas(img);
+      const first = !done;
+      setDone({ canvas, img, engine, notes: sr.notes, ms: performance.now() - t0, params: { ...params }, srKey: key });
+      setJob(null);
+      if (first) {
+        setCmd((c) => ({ kind: 'fit', n: c.n + 1 }));
+        if (!reduceMotion()) {
+          const start = performance.now();
+          const step = (t: number) => {
+            const k = Math.min(1, (t - start) / 900);
+            setFrac(1 - 0.5 * (1 - Math.pow(1 - k, 3)));
+            if (k < 1) requestAnimationFrame(step);
+          };
+          setFrac(1); requestAnimationFrame(step);
+        }
+      }
+    } catch (e) {
+      setJob(null);
+      if (!(e instanceof Cancelled) && (e as Error).name !== 'AbortError') setError((e as Error).message || 'Enhancement failed.');
+    }
+  };
+
+  const chooseMode = (m: ModeId) => { setMode(m); setParams(paramsFor(m, analysis, params.scale)); };
+  const setP = <K extends keyof Params>(k: K, v: Params[K]) => setParams((p) => ({ ...p, [k]: v }));
+
+  /* ---------- drag and drop ---------- */
+  const dropProps = {
+    onDragOver: (e: React.DragEvent) => { if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); setDragging(true); } },
+    onDragLeave: (e: React.DragEvent) => { if (e.currentTarget === e.target) setDragging(false); },
+    onDrop: (e: React.DragEvent) => { e.preventDefault(); setDragging(false); pickFile(e.dataTransfer.files[0]); },
+  };
+
+  const out = src ? { w: src.img.w * params.scale, h: src.img.h * params.scale } : null;
+  const busy = !!job;
+  const engineLabel = engine === 'ai' ? 'AI · Real-ESRGAN' : engine === 'server' ? 'Server · Real-ESRGAN' : 'Conventional';
+
+  return (
+    <div className={`app${dragging ? ' dragging' : ''}`} {...dropProps}>
+      <header className="bar">
+        <div className="brand">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.6" /><circle cx="12" cy="12" r="4.2" fill="var(--accent)" /><path d="M12 3v4M21 12h-4M12 21v-4M3 12h4" stroke="currentColor" strokeWidth="1.2" /></svg>
+          <span>Lumen</span>
+        </div>
+        <EngineStatus rt={rt} engine={engine} server={!!server} />
+        <div className="bar-actions">
+          <button className="btn ghost" onClick={() => setShowInfo((v) => !v)} aria-expanded={showInfo}>What runs where</button>
+          <button className="btn ghost" onClick={() => fileInput.current?.click()}>Open…</button>
+          <button className="btn ghost danger" onClick={clearAll} disabled={!src}>Clear</button>
+        </div>
+        <input ref={fileInput} id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={(e) => pickFile(e.target.files?.[0])} />
+      </header>
+
+      {showInfo && <InfoSheet onClose={() => setShowInfo(false)} rt={rt} server={server} />}
+
+      <main className="work">
+        <section className="canvas-area" aria-label="Image preview">
+          {src ? (
+            <>
+              <Viewer
+                original={src.canvas} enhanced={done?.canvas ?? null}
+                width={done ? done.img.w : src.img.w} height={done ? done.img.h : src.img.h}
+                mode={viewMode} frac={frac} setFrac={setFrac} cmd={cmd} onZoom={setZoom} busy={busy}
+              />
+              {busy && <ProgressOverlay job={job!} onCancel={() => abort.current?.abort()} />}
+              <div className="viewbar">
+                <div className="seg" role="radiogroup" aria-label="Comparison view">
+                  {(['slider', 'side', 'original', 'enhanced'] as ViewMode[]).map((m) => (
+                    <button key={m} role="radio" aria-checked={viewMode === m} className={viewMode === m ? 'on' : ''} disabled={!done && m !== 'slider'} onClick={() => setViewMode(m)}>
+                      {{ slider: 'Slider', side: 'Side by side', original: 'Original', enhanced: 'Enhanced' }[m]}
+                    </button>
+                  ))}
+                </div>
+                <button className="btn primary compact" disabled={busy || !dirty} onClick={run}>
+                  {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? 'Apply' : 'Up to date'}
+                </button>
+                <div className="zoom">
+                  <button className="icon" aria-label="Zoom out" onClick={() => setCmd((c) => ({ kind: 'out', n: c.n + 1 }))}>−</button>
+                  <span className="zoom-val">{Math.round(zoom * (window.devicePixelRatio || 1) * 100)}%</span>
+                  <button className="icon" aria-label="Zoom in" onClick={() => setCmd((c) => ({ kind: 'in', n: c.n + 1 }))}>+</button>
+                  <button className="btn small" onClick={() => setCmd((c) => ({ kind: 'fit', n: c.n + 1 }))}>Fit</button>
+                  <button className="btn small" onClick={() => setCmd((c) => ({ kind: 'pixel', n: c.n + 1 }))}>1:1</button>
+                </div>
+              </div>
+            </>
+          ) : (
+            <DropZone onPick={() => fileInput.current?.click()} />
+          )}
+          {dragging && <div className="drop-veil"><span>Drop to open</span></div>}
+        </section>
+
+        <aside className="inspector" aria-label="Enhancement settings">
+          {error && <div className="alert" role="alert"><strong>Couldn't continue.</strong> {error}</div>}
+
+          {src && analysis && (
+            <section className="card">
+              <div className="card-head">
+                <h2>Analysis</h2>
+                {src.sample && <span className="tag">Sample image</span>}
+              </div>
+              <p className="summary">{analysis.summary}</p>
+              <dl className="facts">
+                <div><dt>Size</dt><dd>{analysis.w} × {analysis.h}</dd></div>
+                <div><dt>File</dt><dd>{analysis.format} · {formatBytes(analysis.bytes)}</dd></div>
+                <div><dt>Sharpness</dt><dd><Level v={analysis.sharpness} bad="soft" mid="moderate" /></dd></div>
+                <div><dt>Compression</dt><dd><Level v={analysis.compression} bad="heavy" mid="moderate" /></dd></div>
+                <div><dt>Noise</dt><dd><Level v={analysis.noise} bad="high" mid="moderate" /></dd></div>
+                <div><dt>Faces</dt><dd>{analyzing ? 'Checking…' : faces === null ? 'Detection unavailable' : faces.length === 0 ? 'None found' : faces.length}</dd></div>
+              </dl>
+              <p className="fine">Quick estimates from pixel statistics. Treat them as a rough guide.</p>
+            </section>
+          )}
+
+          {src && (
+            <section className="card">
+              <h2>Mode</h2>
+              <div className="modes" role="radiogroup" aria-label="Enhancement mode">
+                {MODES.map((m) => (
+                  <button key={m.id} role="radio" aria-checked={mode === m.id} className={`mode${mode === m.id ? ' on' : ''}`} onClick={() => chooseMode(m.id)}>
+                    <span className="mode-name">{m.name}</span>
+                    <span className="mode-blurb">{m.blurb}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {src && (
+            <section className="card">
+              <h2>Adjustments</h2>
+              <Field label="Engine">
+                <div className="seg full" role="radiogroup" aria-label="Engine">
+                  <button role="radio" aria-checked={engine === 'ai'} className={engine === 'ai' ? 'on' : ''} disabled={rt.status === 'failed'} onClick={() => setEngine('ai')}>AI</button>
+                  {server && <button role="radio" aria-checked={engine === 'server'} className={engine === 'server' ? 'on' : ''} onClick={() => setEngine('server')}>Server</button>}
+                  <button role="radio" aria-checked={engine === 'classic'} className={engine === 'classic' ? 'on' : ''} onClick={() => setEngine('classic')}>Conventional</button>
+                </div>
+                {engine === 'classic' && <p className="note">Bicubic resampling with edge-aware denoise and sharpening. It does not reconstruct detail.</p>}
+              </Field>
+              <Field label="Upscale">
+                <div className="seg full" role="radiogroup" aria-label="Upscale factor">
+                  {([2, 4, 8] as Scale[]).map((s) => (
+                    <button key={s} role="radio" aria-checked={params.scale === s} className={params.scale === s ? 'on' : ''} disabled={!scales.includes(s)} onClick={() => setP('scale', s)}>{s}×</button>
+                  ))}
+                </div>
+                {out && <p className="note">Output {out.w} × {out.h}{params.scale === 8 && engine !== 'classic' ? ' · 4× AI, then 2× resampling' : ''}{!scales.includes(8) ? ' · 8× would exceed 16.7 MP' : ''}</p>}
+              </Field>
+              <Range id="denoise" label="Noise & compression removal" value={params.denoise} onChange={(v) => setP('denoise', v)} />
+              <Range id="sharp" label="Sharpness" value={params.sharpness} onChange={(v) => setP('sharpness', v)} />
+              <Range id="texture" label="Texture preservation" value={params.texture} onChange={(v) => setP('texture', v)} />
+              <Range id="color" label="Colour correction" value={params.color} onChange={(v) => setP('color', v)} />
+              <div className="field">
+                <div className="field-row">
+                  <label htmlFor="faceOn">Face protection</label>
+                  <input id="faceOn" type="checkbox" className="switch" checked={params.faceProtect > 0} onChange={(e) => setP('faceProtect', e.target.checked ? 0.7 : 0)} />
+                </div>
+                {params.faceProtect > 0 && <Range id="face" label="Strength" value={params.faceProtect} onChange={(v) => setP('faceProtect', v)} />}
+                <p className="note">Keeps real skin texture and features by easing denoise and sharpening on faces. It never redraws a face.</p>
+                {engine === 'server' && server?.faceModel && (
+                  <label className="check"><input type="checkbox" checked={genFace} onChange={(e) => setGenFace(e.target.checked)} /> Generative face restoration (GFPGAN). Can change likeness; off by default.</label>
+                )}
+              </div>
+              <Range id="strength" label="Natural ↔ Stronger" value={params.strength} onChange={(v) => setP('strength', v)} left="Natural" right="Stronger" />
+
+              <button className="btn primary wide" disabled={busy || !dirty} onClick={run}>
+                {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? (fastApply ? 'Apply changes' : `Re-enhance ${params.scale}×`) : 'Up to date'}
+              </button>
+              <p className="fine">{engine === 'server' ? 'Your image is sent to your server for processing and is not stored there.' : 'Processing runs on this device. Your image is never uploaded.'}</p>
+            </section>
+          )}
+
+          {done && src && <ExportCard done={done} src={src} />}
+
+          {done && (
+            <section className="card quiet">
+              <h2>Last run</h2>
+              <ul className="notes">
+                <li>{done.engine === 'ai' ? 'AI reconstruction with Real-ESRGAN general v3 in your browser' : done.engine === 'server' ? 'Real-ESRGAN on your server' : 'Conventional processing'}</li>
+                {done.notes.filter((n) => !n.startsWith('Conventional') && !n.startsWith('Real-ESRGAN on')).map((n) => <li key={n}>{n}</li>)}
+                <li>{src!.img.w} × {src!.img.h} → {done.img.w} × {done.img.h}</li>
+              </ul>
+            </section>
+          )}
+        </aside>
+      </main>
+    </div>
+  );
+}
+
+/* ---------- pieces ---------- */
+
+function EngineStatus({ rt, engine, server }: { rt: RtState; engine: EngineKind; server: boolean }) {
+  let cls = 'status', text: string;
+  if (engine === 'classic') { text = 'Conventional processing (not AI)'; cls += ' warn'; }
+  else if (engine === 'server') { text = 'Server engine connected'; cls += ' ok'; }
+  else if (rt.status === 'loading') { text = 'Loading AI model…'; cls += ' busy'; }
+  else if (rt.status === 'ready') { text = `AI ready · ${rt.info.gpu ? 'GPU' : 'CPU, slow'}`; cls += rt.info.gpu ? ' ok' : ' warn'; }
+  else { text = 'AI unavailable here'; cls += ' warn'; }
+  return <div className={cls} title={rt.status === 'failed' ? rt.info.error : undefined}><i aria-hidden="true" />{text}{server && engine !== 'server' ? ' · server available' : ''}</div>;
+}
+
+function Level({ v, bad, mid }: { v: string; bad: string; mid: string }) {
+  return <span className={`level ${v === bad ? 'bad' : v === mid ? 'mid' : 'good'}`}>{v}</span>;
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return <div className="field"><div className="field-label">{label}</div>{children}</div>;
+}
+
+function Range({ id, label, value, onChange, left, right }: { id: string; label: string; value: number; onChange: (v: number) => void; left?: string; right?: string }) {
+  return (
+    <div className="field">
+      <div className="field-row"><label htmlFor={id}>{label}</label>{!left && <output htmlFor={id}>{pct(value)}</output>}</div>
+      <input id={id} type="range" min={0} max={1} step={0.01} value={value} onChange={(e) => onChange(+e.target.value)} style={{ '--v': `${value * 100}%` } as React.CSSProperties} />
+      {left && <div className="range-ends"><span>{left}</span><span>{right}</span></div>}
+    </div>
+  );
+}
+
+function ProgressOverlay({ job, onCancel }: { job: Progress; onCancel: () => void }) {
+  const det = job.total != null && job.done != null && job.total > 0;
+  return (
+    <div className="progress" role="status" aria-live="polite">
+      <div className="progress-text">
+        <span>{job.stage}</span>
+        {det && <span className="count">{job.done} of {job.total} tiles</span>}
+      </div>
+      <div className={`track${det ? '' : ' indet'}`}><div className="fill" style={det ? { width: `${(job.done! / job.total!) * 100}%` } : undefined} /></div>
+      <button className="btn small" onClick={onCancel}>Cancel</button>
+    </div>
+  );
+}
+
+function DropZone({ onPick }: { onPick: () => void }) {
+  return (
+    <div className="dropzone">
+      <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true"><rect x="6" y="10" width="36" height="28" rx="4" fill="none" stroke="currentColor" strokeWidth="2" /><circle cx="17" cy="20" r="3.5" fill="currentColor" /><path d="M8 34l10-9 7 6 6-5 9 8" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" /></svg>
+      <h1>Open a photo to enhance</h1>
+      <p>Drop it here, paste it, or choose a file. PNG, JPEG or WebP up to {MAX_FILE_BYTES / 1048576} MB.</p>
+      <button className="btn primary" onClick={onPick}>Choose photo</button>
+    </div>
+  );
+}
+
+function InfoSheet({ onClose, rt, server }: { onClose: () => void; rt: RtState; server: { faceModel: boolean; model: string } | null }) {
+  return (
+    <div className="sheet" role="dialog" aria-label="What runs where">
+      <div className="sheet-inner">
+        <div className="card-head"><h2>What runs where</h2><button className="btn small" onClick={onClose}>Close</button></div>
+        <div className="cols">
+          <div>
+            <h3>In this page, on your device</h3>
+            <ul>
+              <li><b>AI super resolution</b> with Real-ESRGAN general v3 (BSD 3-Clause), running on your GPU through TensorFlow.js. 2× and 4× are fully AI; 8× adds 2× resampling on top.</li>
+              <li><b>Compression and noise removal</b> by the same network; the slider blends its two official checkpoints, like Real-ESRGAN's denoise strength option.</li>
+              <li><b>Face detection</b> with a 190 KB tiny face detector. Faces get gentler processing; nothing is regenerated.</li>
+              <li><b>Colour, texture balance and halo-free sharpening</b> as conventional image processing.</li>
+              <li><b>Mild blur</b> improves because the model was trained on blurred inputs. Strong motion blur does not.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Needs the companion server</h3>
+            <ul>
+              <li><b>Real-ESRGAN x4plus</b>, a larger model (64 MB) with stronger detail on photos.</li>
+              <li><b>Generative face restoration</b> (GFPGAN). Off by default and blended conservatively, because it can alter likeness.</li>
+              <li><b>Very large images</b> beyond your device's memory.</li>
+            </ul>
+            <p className="note">This page can't call outside servers, so the server ships with its own copy of this app. {server ? `Connected: ${server.model}.` : 'Not connected here.'}</p>
+            <p className="note">Engine: {rt.status === 'ready' ? `${rt.info.backend.toUpperCase()}, ${rt.info.tile} px tiles` : rt.status === 'loading' ? 'starting' : `unavailable (${rt.info.error ?? 'no WebGL'})`}.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportCard({ done, src }: { done: Done; src: Source }) {
+  const webp = useMemo(supportsWebpEncode, []);
+  const [fmt, setFmt] = useState<ExportFormat>(src.format === 'PNG' ? 'png' : 'jpeg');
+  const [q, setQ] = useState(0.92);
+  const sizes = useMemo(() => exportSizes(done.img.w, done.img.h, src.img.w, src.img.h), [done, src]);
+  const [sizeId, setSizeId] = useState('full');
+  const size = sizes.find((s) => s.id === sizeId) ?? sizes[0];
+  const [blob, setBlob] = useState<Blob | null>(null);
+  const [pending, setPending] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true; setPending(true); setBlob(null);
+    const t = setTimeout(async () => {
+      try {
+        const canvas = size.id === 'full' ? done.canvas : imgToCanvas(resample(done.img, size.w, size.h));
+        const b = await encode(canvas, fmt, q);
+        if (live) { setBlob(b); setPending(false); }
+      } catch (e) { if (live) { setMsg((e as Error).message); setPending(false); } }
+    }, 350);
+    return () => { live = false; clearTimeout(t); };
+  }, [done, fmt, q, size.id]);
+
+  const base = src.name.replace(/\.[a-z0-9]+$/i, '');
+  const filename = `${base}-enhanced-${size.w}x${size.h}.${fmt === 'jpeg' ? 'jpg' : fmt}`;
+
+  return (
+    <section className="card">
+      <h2>Export</h2>
+      <Field label="Format">
+        <div className="seg full" role="radiogroup" aria-label="Format">
+          {(['png', 'jpeg', 'webp'] as ExportFormat[]).map((f) => (
+            <button key={f} role="radio" aria-checked={fmt === f} className={fmt === f ? 'on' : ''} disabled={f === 'webp' && !webp} onClick={() => setFmt(f)}>{f.toUpperCase()}</button>
+          ))}
+        </div>
+      </Field>
+      {fmt !== 'png' && <Range id="q" label="Quality" value={q} onChange={(v) => setQ(Math.max(0.4, v))} />}
+      <Field label="Size">
+        <select id="size" value={sizeId} onChange={(e) => setSizeId(e.target.value)}>
+          {sizes.map((s) => <option key={s.id} value={s.id}>{s.label} · {s.w} × {s.h}</option>)}
+        </select>
+      </Field>
+      <dl className="facts two">
+        <div><dt>Original</dt><dd>{src.img.w} × {src.img.h} · {formatBytes(src.bytes)}</dd></div>
+        <div><dt>Export</dt><dd>{size.w} × {size.h} · {pending ? 'measuring…' : blob ? formatBytes(blob.size) : '—'}</dd></div>
+      </dl>
+      <button className="btn primary wide" disabled={!blob} onClick={async () => {
+        if (!blob) return;
+        setMsg(null);
+        const r = await saveFile(filename, blob);
+        setMsg(r);
+      }}>Download {fmt.toUpperCase()}</button>
+      {msg && <p className="note" role="status">{msg}</p>}
+    </section>
+  );
+}

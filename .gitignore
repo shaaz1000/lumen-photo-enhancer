@@ -1,0 +1,11 @@
+node_modules/
+dist/
+tests/e2e/out/
+backend/weights/
+backend/static/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.DS_Store
+*.zip

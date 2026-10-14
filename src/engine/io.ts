@@ -1,6 +1,6 @@
 // Decoding, encoding and server calls. Browser only.
 import type { Img } from './ops';
-import type { Params } from './presets';
+import type { ServerRequest, ServerResult } from './pipeline';
 
 export async function decodeFile(blob: Blob): Promise<{ img: Img; canvas: HTMLCanvasElement }> {
   let bmp: ImageBitmap;
@@ -57,19 +57,32 @@ export async function probeServer(): Promise<{ faceModel: boolean; model: string
   } catch { return null; }
 }
 
-export async function serverUpscale(src: Img, p: Params, signal?: AbortSignal, useGenerativeFace = false): Promise<Img> {
+export async function serverEnhance(src: Img, req: ServerRequest, signal?: AbortSignal): Promise<ServerResult> {
   const blob = await encode(imgToCanvas(src), 'png', 1);
   const fd = new FormData();
   fd.append('image', blob, 'input.png');
-  fd.append('scale', String(p.scale === 8 ? 4 : p.scale));
-  fd.append('denoise', String(p.denoise));
-  fd.append('face_restore', useGenerativeFace ? String(p.faceProtect) : '0');
+  fd.append('scale', String(req.scale));
+  fd.append('model', req.model);
+  fd.append('denoise', String(req.dni));
+  fd.append('face_restore', String(req.faceRestore));
+  fd.append('weak', req.weak ? '1' : '0');
+  fd.append('landmarks', JSON.stringify(req.faces.filter((f) => f.lm).map((f) => f.lm)));
   const r = await fetch('./api/enhance', { method: 'POST', body: fd, signal });
   if (!r.ok) {
     let msg = `The server returned ${r.status}.`;
     try { const j = await r.json(); if (j.detail) msg = String(j.detail); } catch { /* keep */ }
     throw new Error(msg);
   }
+  // One PNG, nothing stored on the server: when the texture source is requested
+  // the server stacks it under the main result and says so in X-Lumen-Stack.
+  const info = decodeURIComponent(r.headers.get('X-Lumen-Info') || '').split('|').filter(Boolean);
+  const stacked = r.headers.get('X-Lumen-Stack') === '2';
   const { img } = await decodeFile(await r.blob());
-  return img;
+  if (!stacked) return { primary: img, weak: null, info };
+  const h = img.h / 2, n = img.w * h * 4;
+  return {
+    primary: { w: img.w, h, data: img.data.slice(0, n) },
+    weak: { w: img.w, h, data: img.data.slice(n) },
+    info,
+  };
 }

@@ -192,3 +192,9 @@ select { width: 100%; padding: 8px 10px; border-radius: var(--r-sm); border: 1px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
 }
+
+/* v1.1 additions */
+.note.caution { color: var(--mid); }
+.alert.soft { margin: 0; padding: 8px 10px; font-size: 12.5px; }
+.notes b { color: var(--fg); font-weight: 600; }
+.zoom { flex-wrap: wrap; }

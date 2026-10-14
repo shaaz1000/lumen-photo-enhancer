@@ -197,7 +197,77 @@ def test_real_engine_end_to_end():
     from app.engine import Engine
     e = Engine(WEIGHTS)
     rgb = (np.random.default_rng(2).random((20, 33, 3)) * 255).astype(np.uint8)
-    out = e.upscale(rgb, denoise=0.3, tile=16)  # tiles + seams exercised
+    out = e.upscale(rgb, denoise=0.3, tile=16)  # tiles and seams exercised
     assert out.shape == (80, 132, 3) and out.dtype == np.uint8
     whole = e.upscale(rgb, denoise=0.3, tile=64)
     assert np.abs(out.astype(int) - whole.astype(int)).max() <= 2
+
+
+def test_weak_texture_source_is_stacked():
+    r = post(png(40, 30), scale=2, weak=1)
+    assert r.status_code == 200, r.text
+    assert r.headers.get("x-lumen-stack") == "2"
+    assert Image.open(io.BytesIO(r.content)).size == (80, 120)
+
+
+def test_bad_model_and_landmarks_rejected():
+    assert post(png(), model="huge").status_code == 422
+    assert post(png(), landmarks="[[1,2,3]]").status_code == 422
+    assert post(png(), landmarks="not json").status_code == 422
+
+
+def test_info_header_reports_processing():
+    from urllib.parse import unquote
+    r = post(png(), scale=2)
+    assert "Stub provider" in unquote(r.headers["x-lumen-info"])
+
+
+def test_feathered_tiles_match_whole_image():
+    from app.engine import tiled
+    rng = np.random.default_rng(5)
+    img = (rng.random((23, 37, 3)) * 255).astype(np.uint8)
+    # a local operator with a 3x3 footprint, so 8 px of context is plenty
+    def run(t):
+        p = np.pad(t, ((0, 0), (0, 0), (1, 1), (1, 1)), mode="edge")
+        y = sum(p[:, :, i:i + t.shape[2], j:j + t.shape[3]] for i in range(3) for j in range(3)) / 9
+        return y.repeat(2, 2).repeat(2, 3)
+    a = tiled(run, img, 2, 8, 8, 4)
+    b = tiled(run, img, 2, 64, 8, 4)
+    assert np.abs(a - b).max() < 1e-5
+
+
+def test_deep_model_end_to_end():
+    if not os.path.exists(os.path.join(WEIGHTS, "RealESRGAN_x4plus.pth")):
+        pytest.skip("weights not downloaded")
+    from app.engine import Engine
+    e = Engine(WEIGHTS)
+    rgb = (np.random.default_rng(3).random((14, 18, 3)) * 255).astype(np.uint8)
+    out = e.upscale(rgb, 0.5, "deep", tile=8)
+    whole = e.upscale(rgb, 0.5, "deep", tile=64)
+    assert out.shape == (56, 72, 3)
+    assert np.abs(out.astype(int) - whole.astype(int)).max() <= 6
+
+
+def test_face_alignment_similarity_fit():
+    from app.engine import FFHQ_512, similarity
+    th = 0.25
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    src = (FFHQ_512 - 256) @ R.T * 0.3 + [120, 90]
+    M = similarity(src, FFHQ_512)
+    assert np.abs(src @ M[:, :2].T + M[:, 2] - FFHQ_512).max() < 1e-3
+    assert similarity(np.zeros((5, 2)), FFHQ_512) is None
+
+
+def test_gfpgan_restores_only_inside_the_face():
+    path = os.path.join(WEIGHTS, "gfpgan_1.4.onnx")
+    if not os.path.exists(path):
+        pytest.skip("GFPGAN not downloaded")
+    import onnxruntime as ort
+    from app.engine import FFHQ_512, FaceRestorer
+    fr = FaceRestorer(ort.InferenceSession(path, providers=["CPUExecutionProvider"]))
+    img = np.full((600, 600, 3), 128, np.uint8)
+    lm = FFHQ_512 * 0.5 + [150, 150]   # a face about 256 px wide in the middle
+    out, n = fr.restore(img, [lm], 1.0)
+    assert n == 1 and out.shape == img.shape
+    assert np.abs(out[:20, :20].astype(int) - 128).max() == 0          # corners untouched
+    assert np.abs(out[250:350, 250:350].astype(int) - 128).mean() > 1  # face area changed

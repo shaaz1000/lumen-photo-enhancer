@@ -6,4 +6,6 @@ numpy>=1.26
 onnx>=1.16
 # swap for onnxruntime-gpu on an NVIDIA host
 onnxruntime>=1.19
+# face alignment for GFPGAN
+opencv-python-headless>=4.9
 httpx>=0.27

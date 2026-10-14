@@ -27,12 +27,16 @@ export function planTiles(width: number, height: number, tile: number, pad: numb
 }
 
 /** Picks a tile size that keeps activation memory bounded on phones and laptops. */
-export function chooseTileSize(isMobile: boolean, maxTextureSize: number): number {
-  const base = isMobile ? 128 : 192;
+export function chooseTileSize(isMobile: boolean, maxTextureSize: number, deep = false): number {
+  const base = deep ? (isMobile ? 64 : 128) : isMobile ? 128 : 192;
   return Math.max(64, Math.min(base, Math.floor(maxTextureSize / 16)));
 }
 
-export const MAX_OUTPUT_PIXELS = 16_777_216; // iOS Safari canvas ceiling (4096 x 4096)
+export const MOBILE_OUTPUT_PIXELS = 16_777_216; // iOS Safari canvas ceiling (4096 x 4096)
+export const DESKTOP_OUTPUT_PIXELS = 34_000_000; // fits 1080p at 4x (33.2 MP)
+export let MAX_OUTPUT_PIXELS = MOBILE_OUTPUT_PIXELS;
+/** Desktop browsers handle larger canvases; phones stay at the iOS limit. */
+export function setOutputCap(pixels: number) { MAX_OUTPUT_PIXELS = pixels; }
 export const MAX_INPUT_PIXELS = 12_000_000;
 
 export type Scale = 2 | 4 | 8;

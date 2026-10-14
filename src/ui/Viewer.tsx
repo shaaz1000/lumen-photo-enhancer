@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { fitView, pixelZoom, sliderFraction, sliderX, zoomAt, type View } from './viewMath';
 
 export type ViewMode = 'slider' | 'side' | 'original' | 'enhanced';
-export interface ZoomCmd { kind: 'fit' | 'pixel' | 'in' | 'out'; n: number }
+export interface ZoomCmd { kind: 'fit' | 'pixel' | 'in' | 'out' | 'level' | 'rect'; n: number; /** level: 1 = 100% */ value?: number; rect?: { x: number; y: number; w: number; h: number } }
 
 interface Props {
   original: HTMLCanvasElement;
@@ -57,9 +57,13 @@ export function Viewer(p: Props) {
     const { w, h } = size.current;
     if (p.cmd.kind === 'fit') return fit();
     userZoomed.current = true;
-    if (p.cmd.kind === 'pixel') {
-      const z = pixelZoom(window.devicePixelRatio);
+    if (p.cmd.kind === 'pixel' || p.cmd.kind === 'level') {
+      const z = pixelZoom(window.devicePixelRatio) * (p.cmd.kind === 'level' ? p.cmd.value ?? 1 : 1);
       setView((v) => zoomAt(v, z / v.z, w / 2, h / 2));
+    } else if (p.cmd.kind === 'rect' && p.cmd.rect) {
+      const r = p.cmd.rect;
+      const z = Math.min(16, Math.min(w / r.w, h / r.h) * 0.85);
+      setView({ z, x: w / 2 - (r.x + r.w / 2) * z, y: h / 2 - (r.y + r.h / 2) * z });
     } else setView((v) => zoomAt(v, p.cmd.kind === 'in' ? 1.5 : 1 / 1.5, w / 2, h / 2));
   }, [p.cmd.n]);
 
@@ -128,6 +132,8 @@ export function Viewer(p: Props) {
     else { userZoomed.current = true; setView((v) => zoomAt(v, pz / v.z, pt.x, pt.y)); }
   };
 
+  // both layers use the same resampling so neither is flattered: nearest neighbour (true pixels) once each
+  // enhanced pixel spans 2 or more screen pixels, smooth below that
   const pix = view.z * (window.devicePixelRatio || 1) >= 2;
   const stage = { width: W, height: H, transform: `translate(${view.x}px, ${view.y}px) scale(${view.z})` };
   const enh = p.enhanced;
@@ -139,7 +145,7 @@ export function Viewer(p: Props) {
       onDoubleClick={onDouble}
     >
       <div className="stage" style={stage}>
-        {(which === 'orig' || which === 'both' || !enh) && <Layer src={p.original} cls="orig" />}
+        {(which === 'orig' || which === 'both' || !enh) && <Layer src={p.original} cls="orig" pixelated={pix && !!enh} />}
         {enh && (which === 'enh' || which === 'both') && (
           <div className="clip" style={which === 'both' ? { clipPath: `inset(0 0 0 ${p.frac * 100}%)` } : undefined}>
             <Layer src={enh} cls="enh" pixelated={pix} />

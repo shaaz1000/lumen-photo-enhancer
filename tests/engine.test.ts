@@ -5,11 +5,11 @@ import { analyze, blurEffect, blockiness, noiseSigma, recommendScale, analysisCr
 import { planTiles, allowedScales, fitPixels, MAX_OUTPUT_PIXELS } from '../src/engine/tiling';
 import { validateUpload, validateDimensions, sniffFormat, MAX_FILE_BYTES } from '../src/engine/validate';
 import { resample, sharpenNoHalo, luma, faceMask, planColor, applyColor, makeImg, type Img } from '../src/engine/ops';
-import { writeTile } from '../src/engine/upscale';
+import { planFeatherTiles, ramp, runSr } from '../src/engine/upscale';
 import { enhance, srKey, faceRegion, type Runtime } from '../src/engine/pipeline';
-import { paramsFor, effective, MODES } from '../src/engine/presets';
+import { paramsFor, planFor, MODES, type Caps } from '../src/engine/presets';
 import { parseWeights } from '../src/engine/weights';
-import { buildSrvgg } from '../src/engine/srvgg';
+import { buildSrvgg, type SrModel } from '../src/engine/srvgg';
 
 const meta = JSON.parse(readFileSync('tests/fixtures/analysis_meta.json', 'utf8'));
 const fixture = (k: string): Img => ({ w: meta[k].w, h: meta[k].h, data: new Uint8ClampedArray(readFileSync(`tests/fixtures/${k}.rgba`)) });
@@ -17,20 +17,38 @@ const solid = (w: number, h: number, v: number): Img => { const i = makeImg(w, h
 
 describe('analysis on synthetic degradations', () => {
   it('rates a sharp image crisp, clean and uncompressed', () => {
-    const a = analyze(fixture('sharp'), meta.sharp.bytes, 'PNG', 0);
+    const a = analyze(fixture('sharp'), meta.sharp.bytes, 'PNG', []);
     expect([a.sharpness, a.compression, a.noise]).toEqual(['crisp', 'low', 'low']);
   });
   it('detects blur', () => {
-    expect(analyze(fixture('blurry'), meta.blurry.bytes, 'PNG', 0).sharpness).toBe('soft');
+    expect(analyze(fixture('blurry'), meta.blurry.bytes, 'PNG', []).sharpness).toBe('soft');
+  });
+  it('classifies content', () => {
+    expect(analyze(fixture('sharp'), 1000, 'PNG', [{ x: 60, y: 60, w: 90, h: 90 }]).content).toBe('portrait');
+    expect(analyze(fixture('sharp'), meta.sharp.bytes, 'JPEG', []).content).toBe('photo');
   });
   it('detects heavy JPEG compression', () => {
-    const a = analyze(fixture('jpeg'), meta.jpeg.bytes, 'JPEG', 0);
+    const a = analyze(fixture('jpeg'), meta.jpeg.bytes, 'JPEG', []);
     expect(a.compression).toBe('heavy');
     expect(a.summary).toContain('heavily compressed');
-    expect(a.summary).toMatch(/We recommend \dx|We recommend \d×/);
+    expect(a.summary).toMatch(/We recommend .+ at \d×/);
+  });
+  it('separates mild softness from blur it cannot repair', () => {
+    const soft = analyze(fixture('soft'), meta.soft.bytes, 'PNG', []);
+    expect(soft.blur).toBe('mild');
+    expect(soft.issue).toBe('soft');
+    expect(soft.effectiveScale).toBeLessThan(0.9);
+    const heavy = analyze(fixture('blurry'), meta.blurry.bytes, 'PNG', []);
+    expect(heavy.issue).toBe('heavy-blur');
+    expect(heavy.summary).toMatch(/cannot undo this much blur/);
+    const motion = analyze(fixture('motion'), meta.motion.bytes, 'PNG', []);
+    expect(motion.blur).toBe('motion');
+  });
+  it('sharp images keep full effective resolution', () => {
+    expect(analyze(fixture('sharp'), meta.sharp.bytes, 'PNG', []).effectiveScale).toBe(1);
   });
   it('detects noise', () => {
-    expect(analyze(fixture('noisy'), meta.noisy.bytes, 'PNG', 0).noise).toBe('high');
+    expect(analyze(fixture('noisy'), meta.noisy.bytes, 'PNG', []).noise).toBe('high');
   });
   it('blocking grid ratio is ~1 for an uncompressed image and high for a JPEG', () => {
     const s = fixture('sharp'), j = fixture('jpeg');
@@ -44,7 +62,7 @@ describe('analysis on synthetic degradations', () => {
     expect(blurEffect(luma(f), 64, 64)).toBeGreaterThanOrEqual(0);
   });
   it('reports faces in the opportunities', () => {
-    expect(analyze(fixture('sharp'), 1000, 'PNG', 2).opportunities.join(' ')).toContain('2 faces');
+    expect(analyze(fixture('sharp'), 1000, 'PNG', [{ x: 10, y: 10, w: 40, h: 40 }, { x: 100, y: 10, w: 40, h: 40 }]).opportunities.join(' ')).toContain('2 faces');
   });
   it('keeps the 8 px grid when cropping big images', () => {
     const big = makeImg(2000, 1500);
@@ -52,7 +70,8 @@ describe('analysis on synthetic degradations', () => {
     expect([c.w, c.h]).toEqual([1024, 1024]);
   });
   it('recommends a bigger factor for smaller images and never exceeds the output cap', () => {
-    expect(recommendScale(300, 200)).toBe(8);
+    expect(recommendScale(300, 200)).toBe(4);
+    expect(recommendScale(720, 480, 0.6)).toBe(2);
     expect(recommendScale(720, 480)).toBe(4);
     expect(recommendScale(2400, 1600)).toBe(2);
     expect(recommendScale(3000, 2900)).toBe(2);
@@ -122,8 +141,11 @@ describe('conventional image operations', () => {
   it('sharpening never overshoots the local range (no halos)', () => {
     const img = makeImg(20, 1);
     for (let x = 0; x < 20; x++) { const v = x < 10 ? 50 : 200; img.data.set([v, v, v, 255], x * 4); }
-    const s = sharpenNoHalo(img, 3);
-    for (let p = 0; p < s.data.length; p += 4) { expect(s.data[p]).toBeGreaterThanOrEqual(50); expect(s.data[p]).toBeLessThanOrEqual(200); }
+    const strict = sharpenNoHalo(img, 3, undefined, 1, 0);
+    for (let p = 0; p < strict.data.length; p += 4) { expect(strict.data[p]).toBeGreaterThanOrEqual(50); expect(strict.data[p]).toBeLessThanOrEqual(200); }
+    // default allows a small, bounded overshoot (15% of the local range) for visible crispness
+    const soft = sharpenNoHalo(img, 3);
+    for (let p = 0; p < soft.data.length; p += 4) { expect(soft.data[p]).toBeGreaterThanOrEqual(50 - 23); expect(soft.data[p]).toBeLessThanOrEqual(200 + 23); }
   });
   it('colour correction is bounded and leaves a neutral grey neutral', () => {
     const img = fixture('sharp');
@@ -144,93 +166,151 @@ describe('conventional image operations', () => {
   });
 });
 
-describe('tile writer', () => {
-  it('writes the core of a tile and box-averages for 2x output', () => {
-    const t = { x: 1, y: 0, w: 1, h: 1, px: 0, py: 0, pw: 2, ph: 1 };
-    const src = new Float32Array(2 * 4 * 1 * 4 * 3); // 8x4 output of a 2x1 tile at scale 4
-    for (let i = 0; i < src.length; i += 3) { const x = (i / 3) % 8; src[i] = x >= 4 ? 1 : 0; }
-    const dst = makeImg(4, 2);
-    writeTile(dst, src, t, 4, 2);
-    expect(dst.data[(0 * 4 + 2) * 4]).toBe(255); // core starts at x=2 in 2x space
-    expect(dst.data[0]).toBe(0);
+describe('feathered tiling', () => {
+  it('ramps sum to one across every seam', () => {
+    const a = ramp(20, 0, 6), b = ramp(20, 6, 0);
+    for (let i = 0; i < 6; i++) expect(a[14 + i] + b[i]).toBeCloseTo(1, 6);
+  });
+  it('extended regions cover the image and context stays in bounds', () => {
+    const t = planFeatherTiles(301, 157, 64, 12, 32);
+    for (const x of t) {
+      expect(x.px0).toBeGreaterThanOrEqual(0); expect(x.px1).toBeLessThanOrEqual(301);
+      expect(x.ex0).toBeLessThanOrEqual(x.x0); expect(x.ex1).toBeGreaterThanOrEqual(x.x1);
+    }
+    const cover = new Uint8Array(301 * 157);
+    for (const x of t) for (let y = x.y0; y < x.y1; y++) for (let i = x.x0; i < x.x1; i++) cover[y * 301 + i]++;
+    expect(cover.every((v) => v === 1)).toBe(true);
   });
 });
 
-describe('presets', () => {
+const caps: Caps = { deepOk: true, server: false, faceRestoreOk: false };
+
+describe('presets and planning', () => {
   it('every mode yields controls in range', () => {
     for (const m of MODES) {
       const p = paramsFor(m.id, null, 4);
-      for (const v of [p.denoise, p.sharpness, p.texture, p.color, p.faceProtect, p.strength]) { expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
+      for (const v of [p.denoise, p.sharpness, p.texture, p.color, p.faceProtect, p.faceRestore]) { expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
     }
   });
   it('auto mode raises denoise for compressed images', () => {
-    const jpeg = analyze(fixture('jpeg'), meta.jpeg.bytes, 'JPEG', 0);
-    const clean = analyze(fixture('sharp'), meta.sharp.bytes, 'PNG', 0);
+    const jpeg = analyze(fixture('jpeg'), meta.jpeg.bytes, 'JPEG', []);
+    const clean = analyze(fixture('sharp'), meta.sharp.bytes, 'PNG', []);
     expect(paramsFor('auto', jpeg, 4).denoise).toBeGreaterThan(paramsFor('auto', clean, 4).denoise);
   });
-  it('face protection lowers denoise on faces', () => {
-    const e = effective({ ...paramsFor('portrait', null, 4) });
-    expect(e.faceDni).toBeLessThan(e.dni);
+  it('faithfulness picks the model and reconstruction strength', () => {
+    const base = paramsFor('auto', null, 2);
+    expect(planFor({ ...base, fidelity: 'faithful' }, 'auto', null, caps).model).toBe('general');
+    expect(planFor({ ...base, fidelity: 'balanced' }, 'auto', null, caps).model).toBe('deep');
+    expect(planFor({ ...base, fidelity: 'max' }, 'natural', null, caps).model).toBe('deep');
+    expect(planFor({ ...base, fidelity: 'balanced' }, 'natural', null, caps).model).toBe('general');
+    const f = planFor({ ...base, fidelity: 'faithful' }, 'auto', null, caps).textureMix;
+    const m = planFor({ ...base, fidelity: 'max' }, 'auto', null, caps).textureMix;
+    expect(f).toBeGreaterThan(m);
+  });
+  it('Deep Restoration uses the deep model and matches detail scale on soft images', () => {
+    const soft = analyze(fixture('soft'), meta.soft.bytes, 'PNG', []);
+    const p = planFor(paramsFor('deep', soft, 2), 'deep', soft, caps);
+    expect(p.model).toBe('deep');
+    expect(p.preShrink).toBeLessThan(1);
+    expect(p.preShrink).toBeGreaterThanOrEqual(0.5);
+    expect(p.notes.join(' ')).toMatch(/Processed at/);
+  });
+  it('never shrinks so far that the target needs plain resampling', () => {
+    const soft = analyze(fixture('blurry'), meta.blurry.bytes, 'PNG', []);
+    expect(planFor(paramsFor('deep', soft, 4, 'max'), 'deep', soft, caps).preShrink).toBe(1);
+  });
+  it('falls back to the fast model without a GPU and says so', () => {
+    const p = planFor(paramsFor('deep', null, 2), 'deep', null, { ...caps, deepOk: false });
+    expect(p.model).toBe('general');
+    expect(p.notes[0]).toMatch(/GPU/);
+  });
+  it('face restoration only when the server offers it', () => {
+    const p = paramsFor('deep', null, 2);
+    expect(planFor(p, 'deep', null, caps).faceRestore).toBe(0);
+    expect(planFor(p, 'deep', null, { ...caps, server: true, faceRestoreOk: true }).faceRestore).toBeGreaterThan(0);
   });
   it('finishing-only changes keep the reconstruction cache key', () => {
     const p = paramsFor('auto', null, 4);
-    expect(srKey({ ...p, sharpness: 0.9, color: 0.1 }, 'ai', [])).toBe(srKey(p, 'ai', []));
-    expect(srKey({ ...p, denoise: 0.1 }, 'ai', [])).not.toBe(srKey(p, 'ai', []));
+    const k = (q: typeof p) => srKey(q.scale, planFor(q, 'auto', null, caps), 'ai', []);
+    expect(k({ ...p, sharpness: 0.9, color: 0.1 })).toBe(k(p));
+    expect(k({ ...p, fidelity: 'faithful' })).not.toBe(k(p));
   });
 });
 
 describe('end-to-end pipeline (CPU)', () => {
   const load = (p: string) => { const b = readFileSync(p); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer; };
-  const rt = async (): Promise<Runtime> => {
+  let general: SrModel;
+  const rt = async (tile = 16): Promise<Runtime> => {
     await tf.setBackend('cpu');
-    const w = parseWeights(load('public/models/general-x4v3.bin'));
-    return { tf, tile: 16, getModel: async () => buildSrvgg(tf, w) };
+    general ??= buildSrvgg(tf, parseWeights(load('public/models/general-x4v3.bin')));
+    return { backend: 'CPU', tile: () => tile, getModel: async () => general };
   };
   const crop = (img: Img, w: number, h: number): Img => {
     const o = makeImg(w, h);
     for (let y = 0; y < h; y++) o.data.set(img.data.subarray(y * img.w * 4, (y * img.w + w) * 4), y * w * 4);
     return o;
   };
+  const plan = (scale: 2 | 4, over: object = {}) => planFor({ ...paramsFor('natural', null, scale, 'faithful'), ...over }, 'natural', null, { ...caps, deepOk: false });
 
-  it('AI 4x on a compressed crop returns the right size, opaque, and differs from bicubic', async () => {
-    const clean = crop(fixture('sharp'), 48, 40), jpeg = crop(fixture('jpeg'), 48, 40);
-    const small = resample(jpeg, 12, 10);
+  it('AI 4x on a compressed crop returns the right size, opaque, verified, and differs from bicubic', async () => {
+    const small = resample(crop(fixture('jpeg'), 48, 40), 12, 10);
     const steps: string[] = [];
-    const r = await enhance(small, [], { ...paramsFor('natural', null, 4), texture: 0, sharpness: 0, color: 0 }, 'ai', await rt(), (p) => steps.push(p.stage));
+    const r = await enhance(small, [], 4, plan(4, { texture: 0, sharpness: 0, color: 0 }), 'ai', await rt(), (p) => steps.push(p.stage));
     expect([r.img.w, r.img.h]).toEqual([48, 40]);
     expect(steps).toContain('Reconstructing detail');
     expect(r.img.data[3]).toBe(255);
-    const mse = (a: Img, b: Img) => { let s = 0; for (let i = 0; i < a.data.length; i += 4) for (let c = 0; c < 3; c++) s += (a.data[i + c] - b.data[i + c]) ** 2; return s / (a.w * a.h * 3); };
+    expect(r.models[0]).toMatch(/general v3/);
+    expect(r.stages.join(' ')).toMatch(/Verified against the original/);
     const bic = resample(small, 48, 40);
-    expect(Number.isFinite(mse(r.img, clean))).toBe(true);
-    expect(mse(r.img, bic)).toBeGreaterThan(0); // the network changed something
+    let d = 0; for (let i = 0; i < bic.data.length; i++) d += Math.abs(bic.data[i] - r.img.data[i]);
+    expect(d).toBeGreaterThan(0);
   }, 120000);
 
-  it('tiled and single-tile inference agree away from borders', async () => {
+  it('tiled and whole-image inference agree (feathered seams)', async () => {
     const R = await rt();
     const img = crop(fixture('sharp'), 40, 24);
-    const m = await R.getModel(1);
-    const { runSr } = await import('../src/engine/upscale');
-    const a = await runSr(tf, m, img, { tile: 12, pad: 24, outFactor: 4 });
-    const b = await runSr(tf, m, img, { tile: 64, pad: 24, outFactor: 4 });
+    const m = await R.getModel('general', 1);
+    const a = await runSr(m, img, { tile: 12, outFactor: 4 });
+    const b = await runSr(m, img, { tile: 64, outFactor: 4 });
     let max = 0;
     for (let i = 0; i < a.data.length; i++) max = Math.max(max, Math.abs(a.data[i] - b.data[i]));
     expect(max).toBeLessThanOrEqual(2);
   }, 120000);
 
+  it('2x output is the box average of the 4x output', async () => {
+    const R = await rt(64);
+    const img = crop(fixture('sharp'), 16, 12);
+    const m = await R.getModel('general', 1);
+    const a4 = await runSr(m, img, { tile: 64, outFactor: 4 }), a2 = await runSr(m, img, { tile: 64, outFactor: 2 });
+    const avg = (a4.data[0] + a4.data[4] + a4.data[a4.w * 4] + a4.data[a4.w * 4 + 4]) / 4;
+    expect(Math.abs(a2.data[0] - avg)).toBeLessThanOrEqual(1);
+  }, 60000);
+
   it('conventional path is labelled as such', async () => {
-    const r = await enhance(crop(fixture('sharp'), 20, 20), [], paramsFor('auto', null, 2), 'classic', null, () => {});
+    const r = await enhance(crop(fixture('sharp'), 20, 20), [], 2, plan(2), 'classic', null, () => {});
     expect([r.img.w, r.img.h]).toEqual([40, 40]);
-    expect(r.notes.join(' ')).toMatch(/No AI reconstruction/);
+    expect(r.models.join(' ')).toMatch(/no AI/);
   });
 
   it('can be cancelled', async () => {
     const ctl = new AbortController(); ctl.abort();
-    await expect(enhance(crop(fixture('sharp'), 20, 20), [], paramsFor('auto', null, 2), 'ai', await rt(), () => {}, ctl.signal)).rejects.toThrow('Cancelled');
+    await expect(enhance(crop(fixture('sharp'), 20, 20), [], 2, plan(2), 'ai', await rt(), () => {}, ctl.signal)).rejects.toThrow('Cancelled');
   });
 
   it('reports a failed server instead of faking a result', async () => {
     const failing = async () => { throw new Error('The server returned 503.'); };
-    await expect(enhance(crop(fixture('sharp'), 20, 20), [], paramsFor('auto', null, 2), 'server', null, () => {}, undefined, failing)).rejects.toThrow('503');
+    await expect(enhance(crop(fixture('sharp'), 20, 20), [], 2, plan(2), 'server', null, () => {}, undefined, failing)).rejects.toThrow('503');
+  });
+
+  it('refuses a broken model output instead of exporting it', async () => {
+    const black: SrModel = { name: 'broken', scale: 4, pad: 0, feather: 0, dispose() {}, infer: async (_d, h, w) => new Float32Array(h * 4 * w * 4 * 3) };
+    const bad: Runtime = { backend: 'test', tile: () => 64, getModel: async () => black };
+    await expect(enhance(crop(fixture('sharp'), 20, 20), [], 2, plan(2, { texture: 0 }), 'ai', bad, () => {})).rejects.toThrow(/does not match the original/);
+  });
+
+  it('refuses NaN output', async () => {
+    const nan: SrModel = { name: 'nan model', scale: 4, pad: 0, feather: 0, dispose() {}, infer: async (_d, h, w) => new Float32Array(h * 4 * w * 4 * 3).fill(NaN) };
+    const bad: Runtime = { backend: 'test', tile: () => 64, getModel: async () => nan };
+    await expect(enhance(crop(fixture('sharp'), 20, 20), [], 2, plan(2, { texture: 0 }), 'ai', bad, () => {})).rejects.toThrow(/invalid pixels/);
   });
 });

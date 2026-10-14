@@ -1,7 +1,7 @@
 // Bundles the TypeScript app into one self-contained HTML page.
 // React and TensorFlow.js load from pinned CDN builds as globals.
 import * as esbuild from 'esbuild';
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs';
 
 const globals = {
   'react': 'window.React',
@@ -32,8 +32,11 @@ mkdirSync('dist/models', { recursive: true });
 writeFileSync('dist/index.html', html);
 for (const f of ['general-x4v3', 'general-wdn-x4v3']) copyFileSync(`public/models/${f}.bin`, `dist/models/${f}.wasm`);
 const fa = 'node_modules/@vladmandic/face-api/model/';
-copyFileSync(fa + 'tiny_face_detector_model.bin', 'dist/models/tiny_face_detector_model.wasm');
-const manifest = JSON.parse(readFileSync(fa + 'tiny_face_detector_model-weights_manifest.json', 'utf8'));
-for (const g of manifest) g.paths = g.paths.map((x) => x.replace(/\.bin$/, '.wasm'));
-writeFileSync('dist/models/tiny_face_detector_model-weights_manifest.json', JSON.stringify(manifest));
+for (const f of readdirSync('public/models').filter((x) => x.endsWith('.wasm'))) copyFileSync(`public/models/${f}`, `dist/models/${f}`);
+for (const m of ['tiny_face_detector_model', 'face_landmark_68_model']) {
+  copyFileSync(fa + m + '.bin', `dist/models/${m}.wasm`);
+  const manifest = JSON.parse(readFileSync(fa + m + '-weights_manifest.json', 'utf8'));
+  for (const g of manifest) g.paths = g.paths.map((x) => x.replace(/\.bin$/, '.wasm'));
+  writeFileSync(`dist/models/${m}-weights_manifest.json`, JSON.stringify(manifest));
+}
 console.log(`dist/index.html ${(html.length / 1024).toFixed(0)} KB`);

@@ -1,124 +1,172 @@
-// End-to-end enhancement: AI super resolution (or the labeled conventional
-// path), face-aware finishing, colour, and halo-free sharpening.
-import type { Tf, SrModel } from './srvgg';
+// Degradation-aware enhancement pipeline.
+//
+//   1. match detail scale  shrink soft images so detail sits at pixel scale (only when the plan says so)
+//   2. reconstruct         Real-ESRGAN x4plus (deep) or general v3, tiled with feathered overlap
+//   3. texture             weak-denoise model output mixed in to keep natural grain (and more on faces)
+//   4. faces               generative restoration, server only and opt in
+//   5. finish              restrained colour correction, halo-limited sharpening
+//   6. verify              output must agree with the input at input size, or the run fails
+//
+// Stages 1 to 4 are cached; changing only finishing controls re-runs stage 5 in about a second.
+import type { SrModel } from './srvgg';
 import { runSr, countTiles, Cancelled } from './upscale';
-import { applyColor, bilateral, blend, faceMask, makeImg, planColor, resample, sharpenNoHalo, type Img } from './ops';
-import { effective, type Params } from './presets';
+import { applyColor, bilateral, blend, faceMask, hasAlpha, makeImg, meanDiffAtSize, planColor, resample, sharpenNoHalo, type Img } from './ops';
+import type { ModelKind, Plan } from './presets';
+import type { Scale } from './tiling';
 
 export type EngineKind = 'ai' | 'classic' | 'server';
-export type ServerSr = (src: Img, p: Params, signal?: AbortSignal) => Promise<Img>;
-export interface Box { x: number; y: number; w: number; h: number }
+export interface Box { x: number; y: number; w: number; h: number; /** 5 points: eyes, nose, mouth corners */ lm?: [number, number][] }
 
 export interface Runtime {
-  tf: Tf;
-  getModel(dni: number): Promise<SrModel>;
-  tile: number;
+  getModel(kind: ModelKind, dni: number): Promise<SrModel>;
+  tile(kind: ModelKind): number;
+  backend: string;
 }
+
+export interface ServerRequest { scale: number; model: ModelKind; dni: number; preShrink: number; faceRestore: number; faces: Box[]; weak: boolean }
+export interface ServerResult { primary: Img; weak: Img | null; info: string[] }
+export type ServerSr = (src: Img, req: ServerRequest, signal?: AbortSignal) => Promise<ServerResult>;
 
 export interface Progress { stage: string; done?: number; total?: number }
 
-export interface Result { img: Img; engine: EngineKind; notes: string[]; ms: number }
+export interface Reconstruction { primary: Img; weak: Img | null; stages: string[]; models: string[]; ms: number }
+export interface Result { img: Img; engine: EngineKind; stages: string[]; models: string[]; ms: number }
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/** Cache key for the expensive reconstruction stage; finishing controls are not part of it. */
-export function srKey(p: Params, engine: EngineKind, faces: Box[]): string {
-  const e = effective(p);
+/** Cache key for the expensive stages; finishing controls are not part of it. */
+export function srKey(scale: Scale, plan: Plan, engine: EngineKind, faces: Box[]): string {
   const r = (v: number) => Math.round(v * 20) / 20;
-  return [engine, p.scale, r(e.dni), faces.length && p.faceProtect > 0 ? r(e.faceDni) : 'nf', faces.length].join('|');
+  return [engine, scale, plan.model, r(plan.dni), plan.preShrink, plan.textureMix > 0.02 ? 'w' : '-', r(plan.faceRestore), faces.length].join('|');
+}
+
+export function targetSize(src: Img, scale: number) { return { W: src.w * scale, H: src.h * scale }; }
+
+export async function reconstruct(
+  src: Img, faces: Box[], scale: Scale, plan: Plan, engine: EngineKind, rt: Runtime | null,
+  onProgress: (p: Progress) => void, signal?: AbortSignal, server?: ServerSr,
+): Promise<Reconstruction> {
+  const t0 = performance.now();
+  const check = () => { if (signal?.aborted) throw new Cancelled(); };
+  const { W, H } = targetSize(src, scale);
+  const stages: string[] = [], models: string[] = [];
+  const needWeak = plan.textureMix > 0.02 || (faces.length > 0 && plan.faceTextureBoost > 0);
+
+  if (engine === 'classic') {
+    onProgress({ stage: 'Reducing noise' }); await tick(); check();
+    const clean = bilateral(src, plan.dni);
+    onProgress({ stage: 'Resampling' }); await tick(); check();
+    stages.push('Bilateral denoise', `Bicubic resampling to ${W} × ${H}`);
+    models.push('Conventional processing, no AI');
+    return { primary: resample(clean, W, H), weak: null, stages, models, ms: performance.now() - t0 };
+  }
+
+  // Stage 1: match detail scale
+  let input = src;
+  if (plan.preShrink < 1) {
+    input = resample(src, Math.max(8, Math.round(src.w * plan.preShrink)), Math.max(8, Math.round(src.h * plan.preShrink)));
+    stages.push(`Matched detail scale: ${src.w} × ${src.h} → ${input.w} × ${input.h}`);
+  }
+  // the model always enlarges 4x; box-average to 2x when that already covers the target
+  const outFactor = input.w * 2 >= W * 0.98 ? 2 : 4;
+  const toTarget = (img: Img) => (img.w === W && img.h === H ? img : resample(img, W, H));
+
+  if (engine === 'server') {
+    if (!server) throw new Error('No enhancement server is connected.');
+    onProgress({ stage: 'Enhancing on server' });
+    const r = await server(input, { scale: outFactor, model: plan.model, dni: plan.dni, preShrink: plan.preShrink, faceRestore: plan.faceRestore,
+      faces: faces.map((b) => scaleBox(b, input.w / src.w)), weak: needWeak }, signal);
+    stages.push(`AI reconstruction ${outFactor}× on server`, ...r.info);
+    models.push(plan.model === 'deep' ? 'Real-ESRGAN x4plus (server)' : 'Real-ESRGAN general v3 (server)');
+    if (plan.faceRestore > 0 && r.info.some((s) => s.startsWith('GFPGAN'))) models.push('GFPGAN v1.4 (server)');
+    const primary = toTarget(r.primary);
+    if (primary !== r.primary) stages.push(`Resampled ${r.primary.w} × ${r.primary.h} → ${W} × ${H}`);
+    return { primary, weak: r.weak ? toTarget(r.weak) : null, stages, models, ms: performance.now() - t0 };
+  }
+
+  if (!rt) throw new Error('The AI engine is not loaded.');
+  const primaryTile = rt.tile(plan.model), weakTile = rt.tile('general');
+  const total = countTiles(input.w, input.h, primaryTile) + (needWeak ? countTiles(input.w, input.h, weakTile) : 0);
+  let done = 0;
+  const onTile = () => onProgress({ stage: 'Reconstructing detail', done: ++done, total });
+
+  // Stage 2: reconstruct
+  onProgress({ stage: plan.model === 'deep' ? 'Loading deep model (33 MB, first time only)' : 'Loading model' });
+  const model = await rt.getModel(plan.model, plan.dni);
+  check();
+  onProgress({ stage: 'Reconstructing detail', done: 0, total });
+  let primary = await runSr(model, input, { tile: primaryTile, outFactor, signal, onTile, yieldFn: tick });
+  models.push(model.name + (plan.model === 'general' ? ` (denoise ${Math.round(plan.dni * 100)}%)` : ''));
+  stages.push(`AI reconstruction ${outFactor}× with ${model.name} on ${rt.backend}`);
+
+  // Stage 3: texture source
+  let weak: Img | null = null;
+  if (needWeak) {
+    const wm = await rt.getModel('general', 0);
+    weak = await runSr(wm, input, { tile: weakTile, outFactor, signal, onTile, yieldFn: tick });
+    models.push(`${wm.name} (weak denoise, texture source)`);
+  }
+  check();
+  if (primary.w !== W || primary.h !== H) {
+    stages.push(`Resampled ${primary.w} × ${primary.h} → ${W} × ${H}${scale === 8 ? ' (8× is 4× AI plus 2× resampling)' : ''}`);
+    primary = resample(primary, W, H);
+    if (weak) weak = resample(weak, W, H);
+  }
+  return { primary, weak, stages, models, ms: performance.now() - t0 };
+}
+
+/** Fast finishing stage: texture mix, colour and halo-limited sharpening, then verification. */
+export async function finish(
+  src: Img, rec: Reconstruction, faces: Box[], plan: Plan, engine: EngineKind,
+  onProgress: (p: Progress) => void, signal?: AbortSignal,
+): Promise<{ img: Img; stages: string[] }> {
+  const check = () => { if (signal?.aborted) throw new Cancelled(); };
+  const W = rec.primary.w, H = rec.primary.h, k = W / src.w;
+  const stages: string[] = [];
+  const mask = faces.length ? faceMask(W, H, faces.map((b) => scaleBox(b, k))) : undefined;
+
+  let out = rec.primary;
+  if (rec.weak && (plan.textureMix > 0.02 || mask)) {
+    onProgress({ stage: 'Balancing texture' }); await tick(); check();
+    out = blend(out, rec.weak, plan.textureMix, mask, plan.faceTextureBoost);
+    stages.push(`Texture: ${Math.round(plan.textureMix * 100)}% weak-denoise detail mixed in${mask && plan.faceTextureBoost > 0 ? `, ${Math.round((plan.textureMix + plan.faceTextureBoost) * 100)}% on faces` : ''}`);
+  }
+
+  if (plan.color > 0.01) {
+    onProgress({ stage: 'Correcting colour' }); await tick(); check();
+    out = applyColor(out, planColor(src), plan.color);
+    stages.push(`Colour correction ${Math.round(plan.color * 100)}%`);
+  }
+
+  const amount = engine === 'classic' ? plan.sharpen + 0.6 : plan.sharpen;
+  if (amount > 0.01) {
+    onProgress({ stage: 'Refining edges' }); await tick(); check();
+    out = sharpenNoHalo(out, amount, mask, plan.faceSharpenCut, 0.12, 2);
+    stages.push(`Halo-limited sharpening ${Math.round(amount * 100)}%${mask && plan.faceSharpenCut > 0 ? ', reduced on faces' : ''}`);
+  }
+
+  if (out === rec.primary) out = { w: W, h: H, data: new Uint8ClampedArray(rec.primary.data) };
+  if (hasAlpha(src)) {
+    const a = resample(src, W, H);
+    for (let p = 3; p < out.data.length; p += 4) out.data[p] = a.data[p];
+  }
+
+  // Stage 6: the result must still be this photo. A broken GPU path can return
+  // black, noise or a shifted image; refuse to show or export that.
+  const diff = meanDiffAtSize(out, src);
+  if (!(diff < 28)) throw new Error(`The enhanced image does not match the original (mean difference ${diff.toFixed(1)} levels), so it was discarded. This usually means the GPU ran out of memory or lacks precision; try Faithful or a smaller image.`);
+  stages.push(`Verified against the original: mean difference ${diff.toFixed(1)} levels at original size`);
+  return { img: out, stages };
 }
 
 export async function enhance(
-  src: Img, faces: Box[], p: Params, engine: EngineKind, rt: Runtime | null,
+  src: Img, faces: Box[], scale: Scale, plan: Plan, engine: EngineKind, rt: Runtime | null,
   onProgress: (p: Progress) => void, signal?: AbortSignal, server?: ServerSr,
 ): Promise<Result> {
   const t0 = performance.now();
-  const sr = await superResolve(src, faces, p, engine, rt, onProgress, signal, server);
-  const img = await finish(src, sr.img, faces, p, engine, onProgress, signal);
-  return { img, engine, notes: sr.notes, ms: performance.now() - t0 };
-}
-
-export async function superResolve(
-  src: Img, faces: Box[], p: Params, engine: EngineKind, rt: Runtime | null,
-  onProgress: (p: Progress) => void, signal?: AbortSignal, server?: ServerSr,
-): Promise<{ img: Img; notes: string[] }> {
-  const e = effective(p);
-  const notes: string[] = [];
-  const W = src.w * p.scale, H = src.h * p.scale;
-  const check = () => { if (signal?.aborted) throw new Cancelled(); };
-
-  let out: Img;
-  if (engine === 'ai') {
-    if (!rt) throw new Error('The AI engine is not loaded.');
-    const outFactor: 2 | 4 = p.scale === 2 ? 2 : 4;
-    const pad = 24; // wide enough that tile seams are invisible (verified in tests)
-    const useFace = faces.length > 0 && p.faceProtect > 0 && Math.abs(e.faceDni - e.dni) > 0.04;
-    const regions = useFace ? faces.map((b) => faceRegion(b, src.w, src.h)) : [];
-    const total = countTiles(src.w, src.h, rt.tile) + regions.reduce((n, r) => n + countTiles(r.w, r.h, rt.tile), 0);
-    let done = 0;
-    const onTile = () => onProgress({ stage: 'Reconstructing detail', done: ++done, total });
-    onProgress({ stage: 'Loading model' });
-    const model = await rt.getModel(e.dni);
-    onProgress({ stage: 'Reconstructing detail', done: 0, total });
-    out = await runSr(rt.tf, model, src, { tile: rt.tile, pad, outFactor, signal, onTile, yieldFn: tick });
-
-    if (regions.length) {
-      const fm = await rt.getModel(e.faceDni);
-      for (const r of regions) {
-        const crop = cropImg(src, r);
-        const up = await runSr(rt.tf, fm, crop, { tile: rt.tile, pad, outFactor, signal, onTile, yieldFn: tick });
-        const box = faces[regions.indexOf(r)];
-        const local = faceMask(up.w, up.h, [{ x: (box.x - r.x) * outFactor, y: (box.y - r.y) * outFactor, w: box.w * outFactor, h: box.h * outFactor }])!;
-        pasteMasked(out, up, r.x * outFactor, r.y * outFactor, local);
-      }
-      notes.push(`Gentler denoising on ${faces.length === 1 ? 'one face' : `${faces.length} faces`} to keep real skin texture`);
-    }
-    if (p.scale === 8) {
-      onProgress({ stage: 'Resampling 4× result to 8×' }); await tick(); check();
-      out = resample(out, W, H);
-      notes.push('8× is 4× AI reconstruction followed by 2× bicubic resampling');
-    }
-  } else if (engine === 'server') {
-    if (!server) throw new Error('No enhancement server is connected.');
-    onProgress({ stage: 'Enhancing on server' });
-    out = await server(src, p, signal);
-    if (out.w !== W || out.h !== H) out = resample(out, W, H);
-    notes.push('Real-ESRGAN on the connected server');
-  } else {
-    onProgress({ stage: 'Reducing noise' }); await tick(); check();
-    const clean = bilateral(src, e.dni);
-    onProgress({ stage: 'Resampling' }); await tick(); check();
-    out = resample(clean, W, H);
-    notes.push('Conventional processing: bicubic resampling, bilateral denoise and sharpening. No AI reconstruction.');
-  }
-  return { img: out, notes };
-}
-
-/** Fast finishing stage: texture balance, colour and halo-free sharpening. */
-export async function finish(
-  src: Img, sr: Img, faces: Box[], p: Params, engine: EngineKind,
-  onProgress: (p: Progress) => void, signal?: AbortSignal,
-): Promise<Img> {
-  const e = effective(p);
-  const W = sr.w, H = sr.h;
-  const check = () => { if (signal?.aborted) throw new Cancelled(); };
-  let out = sr;
-  const mask = faces.length && p.faceProtect > 0 ? faceMask(W, H, faces.map((b) => scaleBox(b, W / src.w))) : undefined;
-
-  onProgress({ stage: 'Balancing texture' }); await tick(); check();
-  const plain = resample(src, W, H);
-  if (engine !== 'classic' && (e.texture > 0 || mask)) out = blend(out, plain, e.texture, mask, e.faceTextureBoost);
-
-  onProgress({ stage: 'Correcting colour' }); await tick(); check();
-  out = applyColor(out, planColor(src), e.color);
-
-  onProgress({ stage: 'Refining edges' }); await tick(); check();
-  const amount = engine === 'classic' ? e.sharpen + 0.6 : e.sharpen;
-  out = sharpenNoHalo(out, amount, mask, e.faceSharpenCut);
-
-  if (out === sr) out = { w: sr.w, h: sr.h, data: new Uint8ClampedArray(sr.data) };
-  copyAlpha(out, plain);
-  return out;
+  const rec = await reconstruct(src, faces, scale, plan, engine, rt, onProgress, signal, server);
+  const fin = await finish(src, rec, faces, plan, engine, onProgress, signal);
+  return { img: fin.img, engine, stages: [...rec.stages, ...fin.stages], models: rec.models, ms: performance.now() - t0 };
 }
 
 export function faceRegion(b: Box, w: number, h: number): Box {
@@ -128,23 +176,10 @@ export function faceRegion(b: Box, w: number, h: number): Box {
   return { x, y, w: x1 - x, h: y1 - y };
 }
 
-const scaleBox = (b: Box, s: number): Box => ({ x: b.x * s, y: b.y * s, w: b.w * s, h: b.h * s });
+export const scaleBox = (b: Box, s: number): Box => ({ x: b.x * s, y: b.y * s, w: b.w * s, h: b.h * s, lm: b.lm?.map(([x, y]) => [x * s, y * s] as [number, number]) });
 
 export function cropImg(img: Img, r: Box): Img {
   const out = makeImg(r.w, r.h);
   for (let y = 0; y < r.h; y++) out.data.set(img.data.subarray(((r.y + y) * img.w + r.x) * 4, ((r.y + y) * img.w + r.x + r.w) * 4), y * r.w * 4);
   return out;
-}
-
-function pasteMasked(dst: Img, src: Img, ox: number, oy: number, m: Uint8Array) {
-  for (let y = 0; y < src.h; y++) for (let x = 0; x < src.w; x++) {
-    const k = m[y * src.w + x] / 255; if (!k) continue;
-    const dx = ox + x, dy = oy + y; if (dx >= dst.w || dy >= dst.h) continue;
-    const p = (dy * dst.w + dx) * 4, q = (y * src.w + x) * 4;
-    for (let c = 0; c < 3; c++) dst.data[p + c] += k * (src.data[q + c] - dst.data[p + c]);
-  }
-}
-
-function copyAlpha(dst: Img, src: Img) {
-  for (let p = 3; p < dst.data.length; p += 4) dst.data[p] = src.data[p];
 }

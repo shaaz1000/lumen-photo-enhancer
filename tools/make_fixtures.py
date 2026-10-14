@@ -24,7 +24,11 @@ def save(name, img, fmt_bytes=None):
 
 meta = {}
 meta["sharp"] = save("sharp", im, 60000)
-meta["blurry"] = save("blurry", im.filter(ImageFilter.GaussianBlur(2.2)), 60000)
+meta["blurry"] = save("blurry", im.filter(ImageFilter.GaussianBlur(3.5)), 60000)
+meta["soft"] = save("soft", im.filter(ImageFilter.GaussianBlur(0.9)), 60000)
+a = np.asarray(im, np.float32)
+motion = sum(np.roll(a, k, axis=1) for k in range(-6, 7)) / 13
+meta["motion"] = save("motion", Image.fromarray(motion.astype(np.uint8)), 60000)
 buf = io.BytesIO(); im.save(buf, "JPEG", quality=12)
 meta["jpeg"] = save("jpeg", Image.open(io.BytesIO(buf.getvalue())), len(buf.getvalue()))
 noisy = np.clip(np.asarray(im, np.float32) + rng.normal(0, 14, (H, W, 3)), 0, 255).astype(np.uint8)

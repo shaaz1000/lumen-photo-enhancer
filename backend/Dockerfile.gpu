@@ -1,0 +1,24 @@
+# GPU image: ONNX Runtime with CUDA. Build from the repo root:
+#   docker build -f backend/Dockerfile.gpu -t lumen-gpu .
+#   docker run --gpus all -p 8000:8000 lumen-gpu
+FROM node:22-slim AS web
+WORKDIR /web
+COPY package.json package-lock.json build.mjs ./
+COPY src ./src
+COPY public ./public
+RUN npm ci --ignore-scripts && node build.mjs
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip curl && rm -rf /var/lib/apt/lists/*
+RUN useradd -m app
+WORKDIR /srv
+COPY backend/requirements.txt .
+RUN sed -i 's/^onnxruntime>=.*/onnxruntime-gpu>=1.19/' requirements.txt && pip3 install --no-cache-dir -r requirements.txt
+COPY backend/app ./app
+COPY backend/scripts ./scripts
+RUN sh scripts/download_weights.sh --faces
+COPY --from=web /web/dist ./static
+USER app
+ENV ENHANCER_WEIGHTS=/srv/weights ENHANCER_STATIC=/srv/static ENHANCER_TILE=384 ENHANCER_MAX_INPUT_MP=8
+EXPOSE 8000
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]

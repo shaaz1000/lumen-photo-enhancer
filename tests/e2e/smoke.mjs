@@ -1,11 +1,15 @@
-// End-to-end smoke test in headless Chromium.
-// Usage: CHROME=/path/to/chrome node tests/e2e/smoke.mjs [image ...]
-// Serves dist/ locally, maps the pinned CDN scripts to node_modules copies,
-// loads the app, enhances the sample (and any given images), checks output
-// dimensions and the comparison slider, and writes screenshots to tests/e2e/out.
+// End-to-end test in headless Chromium (software WebGL, so it is slow but real).
+// Usage: CHROME=/path/to/chrome node tests/e2e/smoke.mjs
+// Serves dist/ locally, maps the pinned CDN scripts to node_modules copies, then:
+//   runs the fast model (Faithful) and the deep model (Deep Restoration) on a
+//   small image through WebGL, checks sizes and the processing report, drags the
+//   slider, checks zoom levels, downloads the PNG and proves it holds exactly the
+//   previewed pixels, rejects a corrupt file, and checks the phone layout.
 import { chromium } from 'playwright-core';
 import { createServer } from 'node:http';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { inflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { extname, join } from 'node:path';
 
 const root = new URL('../../', import.meta.url).pathname;
@@ -13,7 +17,7 @@ const dist = join(root, 'dist');
 const out = join(root, 'tests/e2e/out');
 mkdirSync(out, { recursive: true });
 
-const types = { '.html': 'text/html', '.bin': 'application/octet-stream', '.json': 'application/json', '.js': 'text/javascript' };
+const types = { '.html': 'text/html', '.wasm': 'application/wasm', '.json': 'application/json', '.js': 'text/javascript' };
 const server = createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
@@ -49,34 +53,76 @@ async function page(opts) {
   return pg;
 }
 
-const pg = await page({ viewport: { width: 1360, height: 860 }, colorScheme: 'light' });
+// RGB pixels of a PNG (8-bit RGB/RGBA, non-interlaced), for the export check
+function pngRgb(buf) {
+  let p = 8, w = 0, h = 0, ct = 0; const idat = [];
+  while (p < buf.length) {
+    const len = buf.readUInt32BE(p), type = buf.toString('latin1', p + 4, p + 8);
+    if (type === 'IHDR') { w = buf.readUInt32BE(p + 8); h = buf.readUInt32BE(p + 12); ct = buf[p + 17]; }
+    if (type === 'IDAT') idat.push(buf.subarray(p + 8, p + 8 + len));
+    p += 12 + len;
+  }
+  const bpp = ct === 6 ? 4 : 3, stride = w * bpp, z = inflateSync(Buffer.concat(idat));
+  const out = Buffer.alloc(w * h * 3); let prev = Buffer.alloc(stride);
+  for (let y = 0; y < h; y++) {
+    const f = z[y * (stride + 1)], row = z.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)), cur = Buffer.alloc(stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
+      let v = row[i];
+      if (f === 1) v += a; else if (f === 2) v += b; else if (f === 3) v += (a + b) >> 1;
+      else if (f === 4) { const q = a + b - c, pa = Math.abs(q - a), pb = Math.abs(q - b), pc = Math.abs(q - c); v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+      cur[i] = v & 255;
+    }
+    for (let x = 0; x < w; x++) for (let k = 0; k < 3; k++) out[(y * w + x) * 3 + k] = cur[x * bpp + k];
+    prev = cur;
+  }
+  return { w, h, rgb: out };
+}
+
+const pg = await page({ viewport: { width: 1360, height: 860 }, colorScheme: 'light', acceptDownloads: true });
 await pg.waitForSelector('.summary', { timeout: 30000 });
 await pg.waitForFunction(() => document.querySelector('.status')?.textContent?.includes('AI ready'), null, { timeout: 60000 });
 check(true, 'AI engine started: ' + (await pg.textContent('.status')));
 await pg.screenshot({ path: join(out, 'desktop-loaded.png') });
 
-async function enhanceAndCheck(label) {
+async function load(file) {
+  const prev = await pg.textContent('.summary').catch(() => '');
+  await pg.setInputFiles('#file', file);
+  await pg.waitForFunction((p) => { const s = document.querySelector('.summary')?.textContent; return s && s !== p; }, prev, { timeout: 60000 });
+  await pg.waitForFunction(() => ![...document.querySelectorAll('.facts dd')].some((d) => d.textContent?.includes('Checking')), null, { timeout: 120000 });
+}
+async function enhance(label) {
   const t0 = Date.now();
-  await pg.click('button.btn.primary.wide');
+  await pg.click('.inspector button.btn.primary.wide');
   await pg.waitForSelector('.progress', { timeout: 10000 }).catch(() => {});
-  await pg.waitForSelector('.handle', { timeout: 600000 });
-  await pg.waitForSelector('.progress', { state: 'detached', timeout: 600000 });
-  const dims = await pg.evaluate(() => {
-    const c = document.querySelectorAll('canvas.layer');
-    return [...c].map((x) => [x.width, x.height]);
-  });
-  const facts = await pg.textContent('.facts');
-  console.log(`  ${label}: ${((Date.now() - t0) / 1000).toFixed(1)}s, canvases ${JSON.stringify(dims)}`);
-  return { dims, facts };
+  await pg.waitForSelector('.progress', { state: 'detached', timeout: 1800000 });
+  const err = await pg.locator('.alert[role=alert]').textContent().catch(() => null);
+  if (err) { check(false, `${label}: ${err}`); return null; }
+  const dims = await pg.evaluate(() => [...document.querySelectorAll('canvas.layer')].map((x) => [x.width, x.height]));
+  const report = await pg.locator('.card.quiet').textContent();
+  console.log(`  ${label}: ${((Date.now() - t0) / 1000).toFixed(1)} s, canvases ${JSON.stringify(dims)}`);
+  return { dims, report };
 }
 
-const s = await enhanceAndCheck('sample');
-const want = +(await pg.locator('[aria-label="Upscale factor"] button.on').textContent()).replace('×', '');
-check(s.dims.length === 2 && s.dims[1][0] === s.dims[0][0] * want, `sample enhanced to ${want}x`);
-await pg.waitForTimeout(1200);
-await pg.screenshot({ path: join(out, 'desktop-sample-result.png') });
+await load(join(root, 'tests/e2e/small.png'));
+await pg.click('[aria-label="Upscale factor"] >> text=2×');
 
-// slider: drag handle to 25% of the image and read aria-valuenow
+// 1. fast model through WebGL
+await pg.click('[aria-label="Reconstruction strength"] >> text=Faithful');
+const f = await enhance('Faithful (general v3)');
+check(f && f.dims[1][0] === 240 && f.dims[1][1] === 160, 'Faithful produced 240 × 160');
+check(f && /general v3/.test(f.report) && /Verified against the original/.test(f.report), 'report names the fast model and the verification');
+
+// 2. deep model through WebGL
+await pg.click('.modes >> text=Deep Restoration');
+await pg.click('[aria-label="Reconstruction strength"] >> text=Balanced');
+const d = await enhance('Deep Restoration (x4plus)');
+check(d && d.dims[1][0] === 240, 'Deep Restoration produced 240 × 160');
+check(d && /x4plus/.test(d.report) && /GPU \(WebGL\)/.test(d.report), 'report names x4plus running on WebGL');
+await pg.waitForTimeout(1200);
+await pg.screenshot({ path: join(out, 'desktop-deep-result.png') });
+
+// slider follows the pointer
 const stage = await pg.locator('.stage').boundingBox();
 const handle = await pg.locator('.handle').boundingBox();
 await pg.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
@@ -86,41 +132,34 @@ await pg.mouse.up();
 const val = +(await pg.getAttribute('.handle', 'aria-valuenow'));
 check(Math.abs(val - 25) <= 1, `slider tracks pointer (${val}%)`);
 
-// pixel zoom and fit
-await pg.click('text=1:1');
-const zoomTxt = await pg.textContent('.zoom-val');
-check(zoomTxt.trim() === '100%', `1:1 shows 100% (${zoomTxt})`);
-await pg.screenshot({ path: join(out, 'desktop-sample-1to1.png') });
-await pg.click('text=Fit');
+// zoom presets
+for (const z of [100, 200, 400]) {
+  await pg.click(`[aria-label="Zoom to ${z}%"]`);
+  const t = (await pg.textContent('.zoom-val')).trim();
+  check(t === `${z}%`, `zoom ${z}% (${t})`);
+}
+await pg.screenshot({ path: join(out, 'desktop-deep-400.png') });
+await pg.click('.zoom >> text=Fit');
 
-// export: size estimate appears
-await pg.waitForFunction(() => /\d+(\.\d)? (KB|MB)/.test(document.querySelectorAll('.facts.two dd')[1]?.textContent || ''), null, { timeout: 30000 });
-check(true, 'export size measured: ' + (await pg.locator('.facts.two dd').nth(1).textContent()));
+// export: the downloaded PNG holds exactly the previewed pixels
+await pg.waitForFunction(() => /\d+(\.\d)? (KB|MB|B)/.test(document.querySelectorAll('.facts.two dd')[1]?.textContent || ''), null, { timeout: 30000 });
+const [dl] = await Promise.all([pg.waitForEvent('download', { timeout: 30000 }), pg.click('text=Download PNG')]);
+const file = await dl.path();
+const png = pngRgb(readFileSync(file));
+const shown = await pg.evaluate(() => {
+  const c = document.querySelector('canvas.layer.enh');
+  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  const rgb = new Array(c.width * c.height * 3);
+  for (let i = 0, j = 0; i < d.length; i += 4) { rgb[j++] = d[i]; rgb[j++] = d[i + 1]; rgb[j++] = d[i + 2]; }
+  return { w: c.width, h: c.height, rgb };
+});
+const h1 = createHash('sha256').update(png.rgb).digest('hex'), h2 = createHash('sha256').update(Buffer.from(shown.rgb)).digest('hex');
+check(png.w === shown.w && png.h === shown.h && h1 === h2, `downloaded PNG equals the preview pixel for pixel (${png.w} × ${png.h})`);
 
 // invalid upload is rejected with a clear message
 await pg.setInputFiles('#file', { name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('this is not an image at all') });
 await pg.waitForSelector('.alert');
 check((await pg.textContent('.alert')).includes('not a PNG'), 'corrupt file rejected');
-
-for (const img of process.argv.slice(2)) {
-  const prev = await pg.textContent('.summary').catch(() => '');
-  await pg.setInputFiles('#file', img);
-  await pg.waitForFunction((p) => { const s = document.querySelector('.summary')?.textContent; return s && s !== p; }, prev, { timeout: 60000 });
-  await pg.waitForFunction(() => ![...document.querySelectorAll('.facts dd')].some((d) => d.textContent?.includes('Checking')), null, { timeout: 120000 });
-  const summary = await pg.textContent('.summary');
-  const facesTxt = await pg.locator('.facts > div').nth(5).textContent();
-  console.log(`  ${img}: ${summary} | ${facesTxt}`);
-  const r = await enhanceAndCheck(img);
-  check(r.dims.length === 2, `${img} enhanced`);
-  await pg.waitForTimeout(1200);
-  const name = img.split('/').pop().replace(/\W+/g, '_');
-  await pg.screenshot({ path: join(out, `desktop-${name}.png`) });
-  await pg.click('text=Side by side');
-  await pg.click('text=1:1');
-  await pg.screenshot({ path: join(out, `desktop-${name}-side.png`) });
-  await pg.click('text=Slider');
-  await pg.click('text=Fit');
-}
 
 // phone layout in dark mode
 const ph = await page({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, colorScheme: 'dark', isMobile: true, hasTouch: true });

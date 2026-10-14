@@ -3,7 +3,7 @@
 // --denoise_strength option does (deep network interpolation).
 
 export type TensorKind = 'conv' | 'bias' | 'prelu';
-export interface RawTensor { kind: TensorKind; shape: number[]; data: Float32Array }
+export interface RawTensor { kind: TensorKind; shape: number[]; data: Float32Array; name?: string }
 export interface ModelWeights { arch: string; scale: number; tensors: RawTensor[] }
 
 const HALF_TABLE = (() => {
@@ -27,22 +27,31 @@ export function parseWeights(buf: ArrayBuffer): ModelWeights {
   if (magic !== 'RESR') throw new Error('Model file is damaged or not a Real-ESRGAN weight file.');
   const dv = new DataView(buf);
   const version = dv.getUint32(4, true);
-  if (version !== 1) throw new Error(`Unsupported weight file version ${version}.`);
+  if (version !== 1 && version !== 2) throw new Error(`Unsupported weight file version ${version}.`);
   const hlen = dv.getUint32(8, true);
   const header = JSON.parse(new TextDecoder().decode(bytes.subarray(12, 12 + hlen)));
   let off = 12 + hlen;
   off += off % 2;
   const tensors: RawTensor[] = [];
-  for (const t of header.tensors as { kind: TensorKind; shape: number[] }[]) {
+  for (const t of header.tensors as { kind: TensorKind; shape: number[]; name?: string }[]) {
     const n = t.shape.reduce((a, b) => a * b, 1);
     if (off + n * 2 > buf.byteLength) throw new Error('Model file is truncated.');
     const halves = new Uint16Array(buf.slice(off, off + n * 2));
     const data = new Float32Array(n);
     for (let i = 0; i < n; i++) data[i] = HALF_TABLE[halves[i]];
-    tensors.push({ kind: t.kind, shape: t.shape, data });
+    tensors.push({ kind: t.kind, shape: t.shape, data, name: t.name });
     off += n * 2;
   }
   return { arch: header.arch, scale: header.scale, tensors };
+}
+
+/** Joins split weight files back into one buffer. */
+export function concatParts(parts: ArrayBuffer[]): ArrayBuffer {
+  const n = parts.reduce((a, p) => a + p.byteLength, 0);
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { out.set(new Uint8Array(p), o); o += p.byteLength; }
+  return out.buffer;
 }
 
 /** strength 1 = full denoise checkpoint, 0 = weak-denoise checkpoint. */

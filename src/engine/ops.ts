@@ -98,14 +98,18 @@ function blur3(src: Float32Array, w: number, h: number): Float32Array {
 }
 
 /**
- * Unsharp mask on luminance with an overshoot limiter: the sharpened value is
- * clamped to the local 3x3 min/max, which removes the bright and dark halos
- * classic sharpening leaves around edges. mask (0..255) scales the amount.
+ * Unsharp mask on luminance with an overshoot limiter. The sharpened value may
+ * pass the local 3x3 min/max by only `overshoot` of the local range, which keeps
+ * edges crisp without the bright and dark halos of classic sharpening.
+ * `passes` widens the blur (1: fine detail, 2: medium detail at upscaled sizes).
+ * mask (0..255) lowers the amount, e.g. on skin.
  */
-export function sharpenNoHalo(img: Img, amount: number, mask?: Uint8Array, maskScale = 1): Img {
+export function sharpenNoHalo(img: Img, amount: number, mask?: Uint8Array, maskScale = 1, overshoot = 0.15, passes = 2): Img {
   if (amount <= 0) return img;
   const { w, h, data } = img;
-  const Y = luma(img), B = blur3(Y, w, h);
+  const Y = luma(img);
+  let B = blur3(Y, w, h);
+  for (let i = 1; i < passes; i++) B = blur3(B, w, h);
   const out = makeImg(w, h);
   for (let y = 0; y < h; y++) {
     const y0 = y > 0 ? y - 1 : y, y1 = y < h - 1 ? y + 1 : y;
@@ -119,16 +123,38 @@ export function sharpenNoHalo(img: Img, amount: number, mask?: Uint8Array, maskS
         if (b < lo) lo = b; if (b > hi) hi = b;
         if (c < lo) lo = c; if (c > hi) hi = c;
       }
+      const slack = (hi - lo) * overshoot;
       let k = amount;
       if (mask) k *= 1 - (maskScale * mask[i]) / 255;
       let s = Y[i] + k * (Y[i] - B[i]);
-      s = s < lo ? lo : s > hi ? hi : s;
+      s = s < lo - slack ? lo - slack : s > hi + slack ? hi + slack : s;
       const d = s - Y[i], p = i * 4;
       out.data[p] = clamp255(data[p] + d); out.data[p + 1] = clamp255(data[p + 1] + d);
       out.data[p + 2] = clamp255(data[p + 2] + d); out.data[p + 3] = data[p + 3];
     }
   }
   return out;
+}
+
+/** Mean absolute difference per channel after box-shrinking `big` to `small`'s size. */
+export function meanDiffAtSize(big: Img, small: Img): number {
+  const fx = big.w / small.w, fy = big.h / small.h;
+  let sum = 0, n = 0;
+  const step = Math.max(1, Math.floor(Math.sqrt((small.w * small.h) / 40000)));
+  for (let y = 0; y < small.h; y += step) for (let x = 0; x < small.w; x += step) {
+    const bx0 = Math.floor(x * fx), by0 = Math.floor(y * fy), bx1 = Math.max(bx0 + 1, Math.floor((x + 1) * fx)), by1 = Math.max(by0 + 1, Math.floor((y + 1) * fy));
+    for (let c = 0; c < 3; c++) {
+      let acc = 0, cnt = 0;
+      for (let yy = by0; yy < by1; yy++) for (let xx = bx0; xx < bx1; xx++) { acc += big.data[(yy * big.w + xx) * 4 + c]; cnt++; }
+      sum += Math.abs(acc / cnt - small.data[(y * small.w + x) * 4 + c]); n++;
+    }
+  }
+  return n ? sum / n : 0;
+}
+
+export function hasAlpha(img: Img): boolean {
+  for (let p = 3; p < img.data.length; p += 4) if (img.data[p] < 255) return true;
+  return false;
 }
 
 /* ---------- colour ---------- */

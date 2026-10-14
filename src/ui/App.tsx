@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { analyze, type Analysis } from '../engine/analysis';
-import { MODES, paramsFor, type ModeId, type Params } from '../engine/presets';
-import { finish, srKey, superResolve, type Box, type EngineKind, type Progress, type Runtime } from '../engine/pipeline';
+import { FIDELITY, MODES, paramsFor, planFor, type Caps, type Fidelity, type ModeId, type Params, type Plan } from '../engine/presets';
+import { finish, reconstruct, srKey, type Box, type EngineKind, type Progress, type Reconstruction, type Runtime } from '../engine/pipeline';
 import { Cancelled } from '../engine/upscale';
-import { allowedScales, MAX_INPUT_PIXELS, type Scale } from '../engine/tiling';
+import { allowedScales, MAX_INPUT_PIXELS, MAX_OUTPUT_PIXELS, type Scale } from '../engine/tiling';
 import { validateDimensions, validateUpload, MAX_FILE_BYTES } from '../engine/validate';
-import { decodeFile, encode, imgToCanvas, probeServer, serverUpscale, supportsWebpEncode, type ExportFormat } from '../engine/io';
+import { decodeFile, encode, imgToCanvas, probeServer, serverEnhance, supportsWebpEncode, type ExportFormat } from '../engine/io';
 import { detectFaces, initRuntime, type RuntimeInfo } from '../engine/runtime';
 import { resample, type Img } from '../engine/ops';
 import { Viewer, type ViewMode, type ZoomCmd } from './Viewer';
@@ -14,11 +14,12 @@ import { makeSample } from './sample';
 import { saveFile } from './save';
 
 interface Source { img: Img; canvas: HTMLCanvasElement; name: string; bytes: number; format: string; sample: boolean }
-interface Done { canvas: HTMLCanvasElement; img: Img; engine: EngineKind; notes: string[]; ms: number; params: Params; srKey: string }
+interface Done { canvas: HTMLCanvasElement; img: Img; engine: EngineKind; stages: string[]; models: string[]; ms: number; params: Params; mode: ModeId; srKey: string; plan: Plan }
 type RtState = { status: 'loading' } | { status: 'ready'; rt: Runtime; info: RuntimeInfo } | { status: 'failed'; info: RuntimeInfo };
 
 const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const pct = (v: number) => `${Math.round(v * 100)}%`;
+const ISSUE: Record<string, string> = { 'heavy-blur': 'strong blur', compression: 'compression', noise: 'noise', soft: 'softness', 'low-res': 'low resolution', none: 'none' };
 
 export function App() {
   const [src, setSrc] = useState<Source | null>(null);
@@ -30,7 +31,7 @@ export function App() {
   const [engine, setEngine] = useState<EngineKind>('ai');
   const [rt, setRt] = useState<RtState>({ status: 'loading' });
   const [server, setServer] = useState<{ faceModel: boolean; model: string } | null>(null);
-  const [genFace, setGenFace] = useState(false);
+  const [faceIdx, setFaceIdx] = useState(0);
   const [done, setDone] = useState<Done | null>(null);
   const [job, setJob] = useState<Progress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -40,7 +41,7 @@ export function App() {
   const [zoom, setZoom] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
-  const srCache = useRef<{ key: string; img: Img; notes: string[]; src: Source } | null>(null);
+  const srCache = useRef<{ key: string; rec: Reconstruction; src: Source } | null>(null);
   const abort = useRef<AbortController | null>(null);
   const rtPromise = useRef<Promise<RtState> | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -88,13 +89,13 @@ export function App() {
     // first pass without faces so the summary appears immediately
     const a0 = analyze(s.img, s.bytes, s.format, null);
     setAnalysis(a0);
-    setMode('auto'); setParams(paramsFor('auto', a0, a0.recommendedScale));
+    setMode(a0.recommendedMode); setParams((p) => paramsFor(a0.recommendedMode, a0, a0.recommendedScale, p.fidelity));
     const state = await rtPromise.current;
     let boxes: Box[] | null = null;
     if (state?.status === 'ready') boxes = await detectFaces(s.canvas);
-    const a1 = analyze(s.img, s.bytes, s.format, boxes ? boxes.length : null);
-    setFaces(boxes); setAnalysis(a1); setAnalyzing(false);
-    setParams(paramsFor('auto', a1, a1.recommendedScale));
+    const a1 = analyze(s.img, s.bytes, s.format, boxes);
+    setFaces(boxes); setAnalysis(a1); setAnalyzing(false); setFaceIdx(0);
+    setMode(a1.recommendedMode); setParams((p) => paramsFor(a1.recommendedMode, a1, a1.recommendedScale, p.fidelity));
   }, []);
 
   const pickFile = (f: File | undefined) => { if (f) loadBlob(f, f.name); };
@@ -102,8 +103,14 @@ export function App() {
   /* ---------- enhancement ---------- */
   const scales = src ? allowedScales(src.img.w, src.img.h) : ([2, 4, 8] as Scale[]);
   const faceList = faces ?? [];
-  const key = src ? srKey(params, engine, faceList) : '';
-  const dirty = !done || JSON.stringify(done.params) !== JSON.stringify(params) || done.engine !== engine;
+  const caps: Caps = {
+    deepOk: engine === 'server' || (rt.status === 'ready' && rt.info.deepOk),
+    server: engine === 'server',
+    faceRestoreOk: engine === 'server' && !!server?.faceModel,
+  };
+  const plan = planFor(params, mode, analysis, caps);
+  const key = src ? srKey(params.scale, plan, engine, faceList) : '';
+  const dirty = !done || JSON.stringify(done.params) !== JSON.stringify(params) || done.engine !== engine || done.mode !== mode;
   const fastApply = !!done && srCache.current?.key === key && srCache.current.src === src;
 
   const run = async () => {
@@ -120,18 +127,21 @@ export function App() {
         if (s?.status !== 'ready') throw new Error(`The AI engine could not start${s?.status === 'failed' && s.info.error ? `: ${s.info.error}` : ''}. Switch to Conventional to continue.`);
         runtime = s.rt;
       }
+      const t0 = performance.now();
       let sr = srCache.current;
       if (!sr || sr.key !== key || sr.src !== src) {
-        const r = await superResolve(src.img, faceList, params, engine, runtime, prog, ctl.signal,
-          (img, p, sig) => serverUpscale(img, p, sig, genFace));
-        sr = { key, img: r.img, notes: r.notes, src };
+        srCache.current = null; // free the previous result before allocating a new one
+        const rec = await reconstruct(src.img, faceList, params.scale, plan, engine, runtime, prog, ctl.signal, serverEnhance);
+        sr = { key, rec, src };
         srCache.current = sr;
       }
-      const t0 = performance.now();
-      const img = await finish(src.img, sr.img, faceList, params, engine, prog, ctl.signal);
-      const canvas = imgToCanvas(img);
+      const fin = await finish(src.img, sr.rec, faceList, plan, engine, prog, ctl.signal);
+      // the preview and the download both come from this canvas
+      const canvas = imgToCanvas(fin.img);
       const first = !done;
-      setDone({ canvas, img, engine, notes: sr.notes, ms: performance.now() - t0, params: { ...params }, srKey: key });
+      setDone({ canvas, img: fin.img, engine, stages: [...sr.rec.stages, ...fin.stages], models: sr.rec.models,
+        ms: performance.now() - t0,
+        params: { ...params }, mode, srKey: key, plan });
       setJob(null);
       if (first) {
         setCmd((c) => ({ kind: 'fit', n: c.n + 1 }));
@@ -151,7 +161,7 @@ export function App() {
     }
   };
 
-  const chooseMode = (m: ModeId) => { setMode(m); setParams(paramsFor(m, analysis, params.scale)); };
+  const chooseMode = (m: ModeId) => { setMode(m); setParams(paramsFor(m, analysis, params.scale, params.fidelity)); };
   const setP = <K extends keyof Params>(k: K, v: Params[K]) => setParams((p) => ({ ...p, [k]: v }));
 
   /* ---------- drag and drop ---------- */
@@ -209,7 +219,18 @@ export function App() {
                   <span className="zoom-val">{Math.round(zoom * (window.devicePixelRatio || 1) * 100)}%</span>
                   <button className="icon" aria-label="Zoom in" onClick={() => setCmd((c) => ({ kind: 'in', n: c.n + 1 }))}>+</button>
                   <button className="btn small" onClick={() => setCmd((c) => ({ kind: 'fit', n: c.n + 1 }))}>Fit</button>
-                  <button className="btn small" onClick={() => setCmd((c) => ({ kind: 'pixel', n: c.n + 1 }))}>1:1</button>
+                  {[1, 2, 4].map((v) => (
+                    <button key={v} className="btn small" aria-label={`Zoom to ${v * 100}%`} onClick={() => setCmd((c) => ({ kind: 'level', value: v, n: c.n + 1 }))}>{v * 100}%</button>
+                  ))}
+                  {faceList.length > 0 && (
+                    <button className="btn small" title="Frame a face to compare facial detail" onClick={() => {
+                      const b = faceList[faceIdx % faceList.length];
+                      const k = (done ? done.img.w : src.img.w) / src.img.w;
+                      const m = 0.35;
+                      setCmd((c) => ({ kind: 'rect', n: c.n + 1, rect: { x: (b.x - b.w * m) * k, y: (b.y - b.h * m) * k, w: b.w * (1 + 2 * m) * k, h: b.h * (1 + 2 * m) * k } }));
+                      setFaceIdx((i) => i + 1);
+                    }}>Face{faceList.length > 1 ? ` ${(faceIdx % faceList.length) + 1}/${faceList.length}` : ''}</button>
+                  )}
                 </div>
               </div>
             </>
@@ -236,7 +257,10 @@ export function App() {
                 <div><dt>Compression</dt><dd><Level v={analysis.compression} bad="heavy" mid="moderate" /></dd></div>
                 <div><dt>Noise</dt><dd><Level v={analysis.noise} bad="high" mid="moderate" /></dd></div>
                 <div><dt>Faces</dt><dd>{analyzing ? 'Checking…' : faces === null ? 'Detection unavailable' : faces.length === 0 ? 'None found' : faces.length}</dd></div>
+                <div><dt>Real detail</dt><dd>{analysis.effectiveScale >= 1 ? 'Full resolution' : `About ${Math.round(analysis.effectiveScale * 100)}% of size`}</dd></div>
+                <div><dt>Main issue</dt><dd><span className={`level ${analysis.issue === 'heavy-blur' ? 'bad' : analysis.issue === 'none' ? 'good' : 'mid'}`}>{ISSUE[analysis.issue]}</span></dd></div>
               </dl>
+              {analysis.issue === 'heavy-blur' && <p className="alert soft">Strong {analysis.blur === 'motion' ? 'motion' : 'focus'} blur is outside what these models can repair. The result will be cleaner and larger, not sharp.</p>}
               <p className="fine">Quick estimates from pixel statistics. Treat them as a rough guide.</p>
             </section>
           )}
@@ -266,13 +290,23 @@ export function App() {
                 </div>
                 {engine === 'classic' && <p className="note">Bicubic resampling with edge-aware denoise and sharpening. It does not reconstruct detail.</p>}
               </Field>
+              <Field label="Reconstruction">
+                <div className="seg full" role="radiogroup" aria-label="Reconstruction strength">
+                  {FIDELITY.map((f) => (
+                    <button key={f.id} role="radio" aria-checked={params.fidelity === f.id} className={params.fidelity === f.id ? 'on' : ''} onClick={() => setP('fidelity', f.id as Fidelity)}>{f.name}</button>
+                  ))}
+                </div>
+                <p className={`note${params.fidelity === 'max' ? ' caution' : ''}`}>{FIDELITY.find((f) => f.id === params.fidelity)!.note}</p>
+                {engine !== 'classic' && <p className="note">Model: <b>{plan.model === 'deep' ? 'Real-ESRGAN x4plus (deep, 16.7 M parameters)' : 'Real-ESRGAN general v3 (fast, 1.2 M parameters)'}</b>{plan.preShrink < 1 ? ` · detail matched at ${Math.round(plan.preShrink * 100)}%` : ''}</p>}
+                {plan.notes.filter((n) => n.startsWith('Deep model needs')).map((n) => <p key={n} className="note caution">{n}</p>)}
+              </Field>
               <Field label="Upscale">
                 <div className="seg full" role="radiogroup" aria-label="Upscale factor">
                   {([2, 4, 8] as Scale[]).map((s) => (
                     <button key={s} role="radio" aria-checked={params.scale === s} className={params.scale === s ? 'on' : ''} disabled={!scales.includes(s)} onClick={() => setP('scale', s)}>{s}×</button>
                   ))}
                 </div>
-                {out && <p className="note">Output {out.w} × {out.h}{params.scale === 8 && engine !== 'classic' ? ' · 4× AI, then 2× resampling' : ''}{!scales.includes(8) ? ' · 8× would exceed 16.7 MP' : ''}</p>}
+                {out && <p className="note">Output {out.w} × {out.h}{params.scale === 8 && engine !== 'classic' ? ' · 4× AI, then 2× resampling' : ''}{!scales.includes(8) ? ` · 8× would exceed ${(MAX_OUTPUT_PIXELS / 1e6).toFixed(1)} MP` : ''}</p>}
               </Field>
               <Range id="denoise" label="Noise & compression removal" value={params.denoise} onChange={(v) => setP('denoise', v)} />
               <Range id="sharp" label="Sharpness" value={params.sharpness} onChange={(v) => setP('sharpness', v)} />
@@ -284,12 +318,18 @@ export function App() {
                   <input id="faceOn" type="checkbox" className="switch" checked={params.faceProtect > 0} onChange={(e) => setP('faceProtect', e.target.checked ? 0.7 : 0)} />
                 </div>
                 {params.faceProtect > 0 && <Range id="face" label="Strength" value={params.faceProtect} onChange={(v) => setP('faceProtect', v)} />}
-                <p className="note">Keeps real skin texture and features by easing denoise and sharpening on faces. It never redraws a face.</p>
-                {engine === 'server' && server?.faceModel && (
-                  <label className="check"><input type="checkbox" checked={genFace} onChange={(e) => setGenFace(e.target.checked)} /> Generative face restoration (GFPGAN). Can change likeness; off by default.</label>
+                <p className="note">Keeps natural skin texture by mixing in more fine grain and sharpening less on faces. Faces still get full AI reconstruction.</p>
+              </div>
+              <div className="field">
+                {caps.faceRestoreOk ? (
+                  <>
+                    <Range id="faceRestore" label="Face restoration (GFPGAN)" value={params.faceRestore} onChange={(v) => setP('faceRestore', v)} />
+                    <p className={`note${params.faceRestore > 0.6 ? ' caution' : ''}`}>Redraws facial detail with a generative model, then blends it with the original reconstruction. Higher values look sharper but can drift from the person's real likeness.{faceList.length === 0 ? ' No faces found in this image.' : ''}</p>
+                  </>
+                ) : (
+                  <p className="note">Generative face restoration (GFPGAN) runs only on the companion server. Here, faces are reconstructed by the main model without redrawing.</p>
                 )}
               </div>
-              <Range id="strength" label="Natural ↔ Stronger" value={params.strength} onChange={(v) => setP('strength', v)} left="Natural" right="Stronger" />
 
               <button className="btn primary wide" disabled={busy || !dirty} onClick={run}>
                 {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? (fastApply ? 'Apply changes' : `Re-enhance ${params.scale}×`) : 'Up to date'}
@@ -302,12 +342,17 @@ export function App() {
 
           {done && (
             <section className="card quiet">
-              <h2>Last run</h2>
+              <h2>Processing</h2>
+              <dl className="facts two">
+                <div><dt>Original</dt><dd>{src!.img.w} × {src!.img.h}</dd></div>
+                <div><dt>Enhanced</dt><dd>{done.img.w} × {done.img.h}</dd></div>
+              </dl>
               <ul className="notes">
-                <li>{done.engine === 'ai' ? 'AI reconstruction with Real-ESRGAN general v3 in your browser' : done.engine === 'server' ? 'Real-ESRGAN on your server' : 'Conventional processing'}</li>
-                {done.notes.filter((n) => !n.startsWith('Conventional') && !n.startsWith('Real-ESRGAN on')).map((n) => <li key={n}>{n}</li>)}
-                <li>{src!.img.w} × {src!.img.h} → {done.img.w} × {done.img.h}</li>
+                {done.models.map((m) => <li key={m}><b>{m}</b></li>)}
+                {done.stages.map((m, i) => <li key={i}>{m}</li>)}
+                <li>{(done.ms / 1000).toFixed(1)} s{fastApply ? ' (finishing only; reconstruction reused)' : ''}</li>
               </ul>
+              {done.plan.notes.filter((n) => !n.startsWith('Deep model needs')).map((n) => <p key={n} className="note">{n}</p>)}
             </section>
           )}
         </aside>
@@ -323,7 +368,7 @@ function EngineStatus({ rt, engine, server }: { rt: RtState; engine: EngineKind;
   if (engine === 'classic') { text = 'Conventional processing (not AI)'; cls += ' warn'; }
   else if (engine === 'server') { text = 'Server engine connected'; cls += ' ok'; }
   else if (rt.status === 'loading') { text = 'Loading AI model…'; cls += ' busy'; }
-  else if (rt.status === 'ready') { text = `AI ready · ${rt.info.gpu ? 'GPU' : 'CPU, slow'}`; cls += rt.info.gpu ? ' ok' : ' warn'; }
+  else if (rt.status === 'ready') { text = `AI ready · ${rt.info.gpu ? 'GPU' : 'CPU only, fast model'}`; cls += rt.info.gpu ? ' ok' : ' warn'; }
   else { text = 'AI unavailable here'; cls += ' warn'; }
   return <div className={cls} title={rt.status === 'failed' ? rt.info.error : undefined}><i aria-hidden="true" />{text}{server && engine !== 'server' ? ' · server available' : ''}</div>;
 }
@@ -380,19 +425,19 @@ function InfoSheet({ onClose, rt, server }: { onClose: () => void; rt: RtState; 
           <div>
             <h3>In this page, on your device</h3>
             <ul>
-              <li><b>AI super resolution</b> with Real-ESRGAN general v3 (BSD 3-Clause), running on your GPU through TensorFlow.js. 2× and 4× are fully AI; 8× adds 2× resampling on top.</li>
-              <li><b>Compression and noise removal</b> by the same network; the slider blends its two official checkpoints, like Real-ESRGAN's denoise strength option.</li>
-              <li><b>Face detection</b> with a 190 KB tiny face detector. Faces get gentler processing; nothing is regenerated.</li>
-              <li><b>Colour, texture balance and halo-free sharpening</b> as conventional image processing.</li>
-              <li><b>Mild blur</b> improves because the model was trained on blurred inputs. Strong motion blur does not.</li>
+              <li><b>Real-ESRGAN x4plus</b> (16.7 M parameters, BSD 3-Clause) on your GPU through TensorFlow.js. Used by Balanced, Maximum Detail and Deep Restoration. Downloads 33 MB once.</li>
+              <li><b>Real-ESRGAN general v3</b> (1.2 M parameters) for Faithful and as the texture source. Its denoise slider blends the two official checkpoints.</li>
+              <li><b>Detail matching</b>: soft images are processed at their real detail scale so the model rebuilds edges instead of enlarging blur.</li>
+              <li><b>Face detection</b> with alignment points. Faces are reconstructed by the main model, with more natural grain kept on skin.</li>
+              <li><b>Colour and halo-limited sharpening</b> are conventional processing.</li>
+              <li><b>Not repaired</b>: strong motion or focus blur. The analysis flags it.</li>
             </ul>
           </div>
           <div>
             <h3>Needs the companion server</h3>
             <ul>
-              <li><b>Real-ESRGAN x4plus</b>, a larger model (64 MB) with stronger detail on photos.</li>
-              <li><b>Generative face restoration</b> (GFPGAN). Off by default and blended conservatively, because it can alter likeness.</li>
-              <li><b>Very large images</b> beyond your device's memory.</li>
+              <li><b>GFPGAN v1.4 face restoration</b> with adjustable strength. Generative, so it can change likeness.</li>
+              <li><b>Faster x4plus</b> on an NVIDIA GPU, and images beyond your device's memory.</li>
             </ul>
             <p className="note">This page can't call outside servers, so the server ships with its own copy of this app. {server ? `Connected: ${server.model}.` : 'Not connected here.'}</p>
             <p className="note">Engine: {rt.status === 'ready' ? `${rt.info.backend.toUpperCase()}, ${rt.info.tile} px tiles` : rt.status === 'loading' ? 'starting' : `unavailable (${rt.info.error ?? 'no WebGL'})`}.</p>
@@ -405,7 +450,7 @@ function InfoSheet({ onClose, rt, server }: { onClose: () => void; rt: RtState; 
 
 function ExportCard({ done, src }: { done: Done; src: Source }) {
   const webp = useMemo(supportsWebpEncode, []);
-  const [fmt, setFmt] = useState<ExportFormat>(src.format === 'PNG' ? 'png' : 'jpeg');
+  const [fmt, setFmt] = useState<ExportFormat>('png');
   const [q, setQ] = useState(0.92);
   const sizes = useMemo(() => exportSizes(done.img.w, done.img.h, src.img.w, src.img.h), [done, src]);
   const [sizeId, setSizeId] = useState('full');
@@ -439,7 +484,7 @@ function ExportCard({ done, src }: { done: Done; src: Source }) {
           ))}
         </div>
       </Field>
-      {fmt !== 'png' && <Range id="q" label="Quality" value={q} onChange={(v) => setQ(Math.max(0.4, v))} />}
+      {fmt !== 'png' ? <Range id="q" label="Quality" value={q} onChange={(v) => setQ(Math.max(0.4, v))} /> : <p className="note">Lossless: the file holds exactly the pixels in the preview.</p>}
       <Field label="Size">
         <select id="size" value={sizeId} onChange={(e) => setSizeId(e.target.value)}>
           {sizes.map((s) => <option key={s.id} value={s.id}>{s.label} · {s.w} × {s.h}</option>)}

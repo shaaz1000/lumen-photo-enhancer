@@ -80,19 +80,21 @@ export function luma(img: Img): Float32Array {
   return out;
 }
 
-function blur3(src: Float32Array, w: number, h: number): Float32Array {
-  // 1-2-1 separable gaussian
-  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
-  for (let y = 0; y < h; y++) {
-    const r = y * w;
-    for (let x = 0; x < w; x++) {
-      const l = src[r + (x > 0 ? x - 1 : x)], c = src[r + x], rr = src[r + (x < w - 1 ? x + 1 : x)];
-      tmp[r + x] = (l + 2 * c + rr) * 0.25;
+/** 1-2-1 separable gaussian, `passes` times, using two reusable buffers. */
+function blurPasses(src: Float32Array, w: number, h: number, passes: number): Float32Array {
+  const tmp = new Float32Array(src.length);
+  let out = new Float32Array(src.length);
+  let from = src;
+  for (let k = 0; k < passes; k++) {
+    for (let y = 0; y < h; y++) {
+      const r = y * w;
+      for (let x = 0; x < w; x++) tmp[r + x] = (from[r + (x > 0 ? x - 1 : x)] + 2 * from[r + x] + from[r + (x < w - 1 ? x + 1 : x)]) * 0.25;
     }
-  }
-  for (let y = 0; y < h; y++) {
-    const up = (y > 0 ? y - 1 : y) * w, r = y * w, dn = (y < h - 1 ? y + 1 : y) * w;
-    for (let x = 0; x < w; x++) out[r + x] = (tmp[up + x] + 2 * tmp[r + x] + tmp[dn + x]) * 0.25;
+    for (let y = 0; y < h; y++) {
+      const up = (y > 0 ? y - 1 : y) * w, r = y * w, dn = (y < h - 1 ? y + 1 : y) * w;
+      for (let x = 0; x < w; x++) out[r + x] = (tmp[up + x] + 2 * tmp[r + x] + tmp[dn + x]) * 0.25;
+    }
+    from = out;
   }
   return out;
 }
@@ -104,13 +106,12 @@ function blur3(src: Float32Array, w: number, h: number): Float32Array {
  * `passes` widens the blur (1: fine detail, 2: medium detail at upscaled sizes).
  * mask (0..255) lowers the amount, e.g. on skin.
  */
-export function sharpenNoHalo(img: Img, amount: number, mask?: Uint8Array, maskScale = 1, overshoot = 0.15, passes = 2): Img {
+export function sharpenNoHalo(img: Img, amount: number, mask?: Uint8Array, maskScale = 1, overshoot = 0.15, passes = 2, inPlace = false): Img {
   if (amount <= 0) return img;
   const { w, h, data } = img;
   const Y = luma(img);
-  let B = blur3(Y, w, h);
-  for (let i = 1; i < passes; i++) B = blur3(B, w, h);
-  const out = makeImg(w, h);
+  const B = blurPasses(Y, w, h, passes);
+  const out = inPlace ? img : makeImg(w, h);
   for (let y = 0; y < h; y++) {
     const y0 = y > 0 ? y - 1 : y, y1 = y < h - 1 ? y + 1 : y;
     for (let x = 0; x < w; x++) {
@@ -211,8 +212,8 @@ export function applyColor(img: Img, plan: ColorPlan, strength: number, inPlace 
 /* ---------- blending and denoise ---------- */
 
 /** out = a*(1-t) + b*t, with t raised inside the mask by maskBoost. */
-export function blend(a: Img, b: Img, t: number, mask?: Uint8Array, maskBoost = 0): Img {
-  const out = makeImg(a.w, a.h), A = a.data, Bd = b.data, O = out.data;
+export function blend(a: Img, b: Img, t: number, mask?: Uint8Array, maskBoost = 0, inPlace = false): Img {
+  const out = inPlace ? a : makeImg(a.w, a.h), A = a.data, Bd = b.data, O = out.data;
   for (let i = 0, p = 0; p < A.length; i++, p += 4) {
     const k = Math.min(1, t + (mask ? (maskBoost * mask[i]) / 255 : 0));
     O[p] = A[p] + k * (Bd[p] - A[p]); O[p + 1] = A[p + 1] + k * (Bd[p + 1] - A[p + 1]);

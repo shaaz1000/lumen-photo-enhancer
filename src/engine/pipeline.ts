@@ -12,7 +12,7 @@ import type { SrModel } from './srvgg';
 import { runSr, countTiles, Cancelled } from './upscale';
 import { applyColor, bilateral, blend, faceMask, hasAlpha, makeImg, meanDiffAtSize, planColor, resample, sharpenNoHalo, type Img } from './ops';
 import type { ModelKind, Plan } from './presets';
-import type { Scale } from './tiling';
+import { MAX_OUTPUT_PIXELS, MOBILE_OUTPUT_PIXELS, outputDims, type Scale } from './tiling';
 
 export type EngineKind = 'ai' | 'classic' | 'server';
 export interface Box { x: number; y: number; w: number; h: number; /** 5 points: eyes, nose, mouth corners */ lm?: [number, number][] }
@@ -40,7 +40,7 @@ export function srKey(scale: Scale, plan: Plan, engine: EngineKind, faces: Box[]
   return [engine, scale, plan.model, r(plan.dni), plan.preShrink, plan.textureMix > 0.02 ? 'w' : '-', r(plan.faceRestore), faces.length].join('|');
 }
 
-export function targetSize(src: Img, scale: number) { return { W: src.w * scale, H: src.h * scale }; }
+export function targetSize(src: Img, scale: number) { return outputDims(src.w, src.h, scale); }
 
 export async function reconstruct(
   src: Img, faces: Box[], scale: Scale, plan: Plan, engine: EngineKind, rt: Runtime | null,
@@ -48,8 +48,9 @@ export async function reconstruct(
 ): Promise<Reconstruction> {
   const t0 = performance.now();
   const check = () => { if (signal?.aborted) throw new Cancelled(); };
-  const { W, H } = targetSize(src, scale);
+  const { W, H, capped } = targetSize(src, scale);
   const stages: string[] = [], models: string[] = [];
+  if (capped) stages.push(`Output limited to ${W} × ${H} (${(W * H / 1e6).toFixed(1)} MP) to fit this device's memory`);
   const needWeak = plan.textureMix > 0.02 || (faces.length > 0 && plan.faceTextureBoost > 0);
 
   if (engine === 'classic') {
@@ -61,14 +62,19 @@ export async function reconstruct(
     return { primary: resample(clean, W, H), weak: null, stages, models, ms: performance.now() - t0 };
   }
 
-  // Stage 1: match detail scale
+  // Stage 1: match detail scale (and, when the output is capped, shrink so the
+  // model's 2x output is the target size instead of enlarging then throwing pixels away)
   let input = src;
-  if (plan.preShrink < 1) {
-    input = resample(src, Math.max(8, Math.round(src.w * plan.preShrink)), Math.max(8, Math.round(src.h * plan.preShrink)));
-    stages.push(`Matched detail scale: ${src.w} × ${src.h} → ${input.w} × ${input.h}`);
+  const f = Math.min(plan.preShrink, capped ? W / (src.w * 2) : 1);
+  if (f < 0.999) {
+    input = resample(src, Math.max(8, Math.round(src.w * f)), Math.max(8, Math.round(src.h * f)));
+    stages.push(`${plan.preShrink < 1 ? 'Matched detail scale' : 'Resized to fit the output limit'}: ${src.w} × ${src.h} → ${input.w} × ${input.h}`);
   }
   // the model always enlarges 4x; box-average to 2x when that already covers the target
-  const outFactor = input.w * 2 >= W * 0.98 ? 2 : 4;
+  // On phones, also take the 2x output when only a small resample is left, instead of
+  // producing a 4x image (four times the memory) just to shrink it again.
+  const phone = MAX_OUTPUT_PIXELS <= MOBILE_OUTPUT_PIXELS;
+  const outFactor = input.w * 2 >= W * (phone ? 0.8 : 0.98) ? 2 : 4;
   const toTarget = (img: Img) => (img.w === W && img.h === H ? img : resample(img, W, H));
 
   if (engine === 'server') {
@@ -130,27 +136,27 @@ export async function finish(
   const stages: string[] = [];
   const mask = faces.length ? faceMask(W, H, faces.map((b) => scaleBox(b, k))) : undefined;
 
-  let out = rec.primary;
+  // one working copy (the reconstruction stays cached for quick re-finishing), then in place
+  let out: Img = { w: W, h: H, data: new Uint8ClampedArray(rec.primary.data) };
   if (rec.weak && (plan.textureMix > 0.02 || mask)) {
     onProgress({ stage: 'Balancing texture' }); await tick(); check();
-    out = blend(out, rec.weak, plan.textureMix, mask, plan.faceTextureBoost);
+    out = blend(out, rec.weak, plan.textureMix, mask, plan.faceTextureBoost, true);
     stages.push(`Texture: ${Math.round(plan.textureMix * 100)}% weak-denoise detail mixed in${mask && plan.faceTextureBoost > 0 ? `, ${Math.round((plan.textureMix + plan.faceTextureBoost) * 100)}% on faces` : ''}`);
   }
 
   if (plan.color > 0.01) {
     onProgress({ stage: 'Correcting colour' }); await tick(); check();
-    out = applyColor(out, planColor(src), plan.color, out !== rec.primary); // in place when out is already a copy
+    out = applyColor(out, planColor(src), plan.color, true);
     stages.push(`Colour correction ${Math.round(plan.color * 100)}%`);
   }
 
   const amount = engine === 'classic' ? plan.sharpen + 0.6 : plan.sharpen;
   if (amount > 0.01) {
     onProgress({ stage: 'Refining edges' }); await tick(); check();
-    out = sharpenNoHalo(out, amount, mask, plan.faceSharpenCut, 0.12, 2);
+    out = sharpenNoHalo(out, amount, mask, plan.faceSharpenCut, 0.12, 2, true);
     stages.push(`Halo-limited sharpening ${Math.round(amount * 100)}%${mask && plan.faceSharpenCut > 0 ? ', reduced on faces' : ''}`);
   }
 
-  if (out === rec.primary) out = { w: W, h: H, data: new Uint8ClampedArray(rec.primary.data) };
   if (hasAlpha(src)) {
     const a = resample(src, W, H);
     for (let p = 3; p < out.data.length; p += 4) out.data[p] = a.data[p];

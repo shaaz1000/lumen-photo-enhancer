@@ -5,9 +5,9 @@
 **Turn blurry screenshots, compressed Instagram saves and soft video frames into clearer, higher resolution photos.**
 Real-ESRGAN restoration running privately in your browser, with an optional server for generative face restoration.
 
-![version](https://img.shields.io/badge/version-1.1.1-2f5bd3)
+![version](https://img.shields.io/badge/version-1.1.2-2f5bd3)
 ![license](https://img.shields.io/badge/license-MIT-237a4b)
-![tests](https://img.shields.io/badge/tests-79%20passing-237a4b)
+![tests](https://img.shields.io/badge/tests-80%20passing-237a4b)
 ![privacy](https://img.shields.io/badge/images-never%20uploaded-6b7280)
 
 <img src="docs/benchmark/social_screenshot.png" alt="Crops of a degraded cat photo: input, bicubic, version 1.0, Faithful, Deep Restoration, Maximum Detail and the clean reference" width="860">
@@ -99,7 +99,7 @@ Timing above is ONNX Runtime on 2 CPU cores. In the browser the deep model runs 
 
 ## How to use
 
-1. **Open a photo.** Drag it in, paste it, or press **Open**. PNG, JPEG and WebP up to 25 MB and 12 megapixels.
+1. **Open a photo.** Drag it in, paste it, or press **Open**. PNG, JPEG and WebP up to 25 MB and 12 megapixels. For a screenshot, press **Crop** and drag over just the photo.
 2. **Read the analysis.** It shows size, compression, noise, how much real detail the image holds, the main issue, and a recommended mode and scale. These are estimates, not measurements.
 3. **Pick a mode.** The recommended one is selected for you. Use **Deep Restoration** for soft internet photos, **Portrait** when a face matters, **Natural** for minimal change.
 4. **Pick a reconstruction strength.**
@@ -127,7 +127,7 @@ Timing above is ONNX Runtime on 2 CPU cores. In the browser the deep model runs 
 | Detail matching, analysis, finishing, verification | Yes | Finishing runs in the browser |
 | Face detection and alignment points | Yes | Uses the app's landmarks |
 | GFPGAN v1.4 face restoration | No, the model is 340 MB | Yes, opt in, 0 to 100% blend |
-| Very large images | Up to 34 MP output on desktop, 16.7 MP on phones | Configurable |
+| Very large images | Up to 34 MP output on desktop, 6 MP on phones (crop for a bigger result) | Configurable |
 
 A Claude artifact cannot call outside servers, so the artifact runs everything in the browser. The server ships its own copy of the same app, which detects `/api/health` and adds a **Server** engine.
 
@@ -245,7 +245,7 @@ curl -F image=@photo.jpg -F scale=2 -F model=deep http://localhost:8000/api/enha
 ## Testing
 
 ```sh
-npm test                         # 57 tests: models, pipeline, analysis, tiling, viewer maths
+npm test                         # 58 tests: models, pipeline, analysis, tiling, viewer maths
 npm run typecheck
 cd backend && pytest -q          # 22 tests: API, validation, rate limits, ONNX parity, real engine
 CHROME=/path/to/chrome npm run test:e2e   # real WebGL run of both models, slider, zoom, export

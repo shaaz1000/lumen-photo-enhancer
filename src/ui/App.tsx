@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { analyze, type Analysis } from '../engine/analysis';
 import { FIDELITY, MODES, paramsFor, planFor, type Caps, type Fidelity, type ModeId, type Params, type Plan } from '../engine/presets';
-import { finish, reconstruct, srKey, type Box, type EngineKind, type Progress, type Reconstruction, type Runtime } from '../engine/pipeline';
+import { cropImg, finish, reconstruct, srKey, type Box, type EngineKind, type Progress, type Reconstruction, type Runtime } from '../engine/pipeline';
 import { Cancelled } from '../engine/upscale';
-import { allowedScales, MAX_INPUT_PIXELS, MAX_OUTPUT_PIXELS, type Scale } from '../engine/tiling';
+import { allowedScales, outputDims, MAX_INPUT_PIXELS, MAX_OUTPUT_PIXELS, type Scale } from '../engine/tiling';
 import { validateDimensions, validateUpload, MAX_FILE_BYTES } from '../engine/validate';
 import { decodeFile, encode, imgToCanvas, probeServer, serverEnhance, supportsWebpEncode, type ExportFormat } from '../engine/io';
 import { detectFaces, initRuntime, type RuntimeInfo } from '../engine/runtime';
@@ -32,6 +32,8 @@ export function App() {
   const [rt, setRt] = useState<RtState>({ status: 'loading' });
   const [server, setServer] = useState<{ faceModel: boolean; model: string } | null>(null);
   const [faceIdx, setFaceIdx] = useState(0);
+  const [cropping, setCropping] = useState(false);
+  const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [done, setDone] = useState<Done | null>(null);
   const [job, setJob] = useState<Progress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -170,6 +172,17 @@ export function App() {
     }
   };
 
+  const applyCrop = async () => {
+    if (!src || !cropRect || cropRect.w < 16 || cropRect.h < 16) return;
+    const c = imgToCanvas(cropImg(src.img, cropRect));
+    try {
+      const blob = await encode(c, 'png', 1);
+      setCropping(false); setCropRect(null);
+      await loadBlob(blob, src.name.replace(/\.[a-z0-9]+$/i, '') + '-crop.png', false);
+    } finally { c.width = c.height = 0; }
+  };
+  const startCrop = () => { setCropping(true); setCropRect(null); setViewMode('original'); setCmd((c) => ({ kind: 'fit', n: c.n + 1 })); };
+
   const chooseMode = (m: ModeId) => { setMode(m); setParams(paramsFor(m, analysis, params.scale, params.fidelity)); };
   const setP = <K extends keyof Params>(k: K, v: Params[K]) => setParams((p) => ({ ...p, [k]: v }));
 
@@ -180,7 +193,8 @@ export function App() {
     onDrop: (e: React.DragEvent) => { e.preventDefault(); setDragging(false); pickFile(e.dataTransfer.files[0]); },
   };
 
-  const out = src ? { w: src.img.w * params.scale, h: src.img.h * params.scale } : null;
+  const dims = src ? outputDims(src.img.w, src.img.h, params.scale) : null;
+  const out = dims ? { w: dims.W, h: dims.H, capped: dims.capped } : null;
   const busy = !!job;
   const engineLabel = engine === 'ai' ? 'AI · Real-ESRGAN' : engine === 'server' ? 'Server · Real-ESRGAN' : 'Conventional';
 
@@ -207,10 +221,18 @@ export function App() {
           {src ? (
             <>
               <Viewer
-                original={src.url} enhanced={done?.url ?? null}
-                width={done ? done.img.w : src.img.w} height={done ? done.img.h : src.img.h}
-                mode={viewMode} frac={frac} setFrac={setFrac} cmd={cmd} onZoom={setZoom} busy={busy}
+                original={src.url} enhanced={cropping ? null : done?.url ?? null}
+                width={done && !cropping ? done.img.w : src.img.w} height={done && !cropping ? done.img.h : src.img.h}
+                mode={cropping ? 'original' : viewMode} frac={frac} setFrac={setFrac} cmd={cmd} onZoom={setZoom} busy={busy}
+                cropMode={cropping} crop={cropRect} onCrop={setCropRect}
               />
+              {cropping && (
+                <div className="cropbar" role="toolbar" aria-label="Crop">
+                  <span>{cropRect && cropRect.w >= 16 ? `${cropRect.w} × ${cropRect.h}` : 'Drag over the part to keep'}</span>
+                  <button className="btn small" onClick={() => { setCropping(false); setCropRect(null); setViewMode('slider'); }}>Cancel</button>
+                  <button className="btn small primary" disabled={!cropRect || cropRect.w < 16 || cropRect.h < 16} onClick={applyCrop}>Apply crop</button>
+                </div>
+              )}
               {busy && <ProgressOverlay job={job!} onCancel={() => abort.current?.abort()} />}
               <div className="viewbar">
                 <div className="seg" role="radiogroup" aria-label="Comparison view">
@@ -220,7 +242,8 @@ export function App() {
                     </button>
                   ))}
                 </div>
-                <button className="btn primary compact" disabled={busy || !dirty} onClick={run}>
+                <button className="btn small" disabled={busy || cropping} onClick={startCrop}>Crop</button>
+                <button className="btn primary compact" disabled={busy || !dirty || cropping} onClick={run}>
                   {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? 'Apply' : 'Up to date'}
                 </button>
                 <div className="zoom">
@@ -270,6 +293,9 @@ export function App() {
                 <div><dt>Main issue</dt><dd><span className={`level ${analysis.issue === 'heavy-blur' ? 'bad' : analysis.issue === 'none' ? 'good' : 'mid'}`}>{ISSUE[analysis.issue]}</span></dd></div>
               </dl>
               {analysis.issue === 'heavy-blur' && <p className="alert soft">Strong {analysis.blur === 'motion' ? 'motion' : 'focus'} blur is outside what these models can repair. The result will be cleaner and larger, not sharp.</p>}
+              {!src.sample && Math.max(analysis.w, analysis.h) / Math.min(analysis.w, analysis.h) >= 1.9 && (
+                <p className="tip">This looks like a phone screenshot. Crop to just the photo for a bigger, faster result.<button className="btn small" onClick={startCrop}>Crop</button></p>
+              )}
               <p className="fine">Quick estimates from pixel statistics. Treat them as a rough guide.</p>
             </section>
           )}
@@ -315,7 +341,7 @@ export function App() {
                     <button key={s} role="radio" aria-checked={params.scale === s} className={params.scale === s ? 'on' : ''} disabled={!scales.includes(s)} onClick={() => setP('scale', s)}>{s}×</button>
                   ))}
                 </div>
-                {out && <p className="note">Output {out.w} × {out.h}{params.scale === 8 && engine !== 'classic' ? ' · 4× AI, then 2× resampling' : ''}{!scales.includes(8) ? ` · 8× would exceed ${(MAX_OUTPUT_PIXELS / 1e6).toFixed(1)} MP` : ''}</p>}
+                {out && <p className="note">Output {out.w} × {out.h}{out.capped ? ` (limited to ${(MAX_OUTPUT_PIXELS / 1e6).toFixed(0)} MP on this device; crop for a bigger result)` : ''}{params.scale === 8 && engine !== 'classic' ? ' · 4× AI, then 2× resampling' : ''}{!scales.includes(4) ? ` · 4× would exceed ${(MAX_OUTPUT_PIXELS / 1e6).toFixed(0)} MP` : !scales.includes(8) ? ` · 8× would exceed ${(MAX_OUTPUT_PIXELS / 1e6).toFixed(0)} MP` : ''}</p>}
               </Field>
               <Range id="denoise" label="Noise & compression removal" value={params.denoise} onChange={(v) => setP('denoise', v)} />
               <Range id="sharp" label="Sharpness" value={params.sharpness} onChange={(v) => setP('sharpness', v)} />
@@ -340,7 +366,7 @@ export function App() {
                 )}
               </div>
 
-              <button className="btn primary wide" disabled={busy || !dirty} onClick={run}>
+              <button className="btn primary wide" disabled={busy || !dirty || cropping} onClick={run}>
                 {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? (fastApply ? 'Apply changes' : `Re-enhance ${params.scale}×`) : 'Up to date'}
               </button>
               <p className="fine">{engine === 'server' ? 'Your image is sent to your server for processing and is not stored there.' : 'Processing runs on this device. Your image is never uploaded.'}</p>

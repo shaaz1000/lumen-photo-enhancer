@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-14
+
+### Fixed
+
+* The page reloading on iPhone right after an enhancement finished, which brought back the start image. A full phone screenshot at 2× made a 12 MP result, and finishing, encoding and showing it exceeded the memory iOS allows a page.
+  * Phones now have a 6 MP output budget. 2× stays available and is shrunk to fit; the input is resized first so the model never produces pixels that are thrown away.
+  * Finishing works on one copy in place instead of allocating a new full-size image per step.
+  * On phones, the model's 2× output is used when only a small resample remains, instead of a 4× image four times the size.
+
+### Added
+
+* Crop tool: drag over the part to keep, then enhance only that. Screenshots get a tip suggesting it.
+
 ## [1.1.1] - 2026-10-14
 
 ### Fixed

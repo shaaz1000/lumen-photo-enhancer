@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as tf from '@tensorflow/tfjs';
 import { readFileSync } from 'node:fs';
 import { analyze, blurEffect, blockiness, noiseSigma, recommendScale, analysisCrop } from '../src/engine/analysis';
-import { planTiles, allowedScales, fitPixels, MAX_OUTPUT_PIXELS } from '../src/engine/tiling';
+import { planTiles, allowedScales, fitPixels, outputDims, MAX_OUTPUT_PIXELS } from '../src/engine/tiling';
 import { validateUpload, validateDimensions, sniffFormat, MAX_FILE_BYTES } from '../src/engine/validate';
 import { resample, sharpenNoHalo, luma, faceMask, planColor, applyColor, makeImg, type Img } from '../src/engine/ops';
 import { planFeatherTiles, ramp, runSr } from '../src/engine/upscale';
@@ -93,9 +93,15 @@ describe('tiling', () => {
     expect(tiles.every((t) => t.ph === 10)).toBe(true);
   });
   it('limits scales to the output pixel budget', () => {
-    expect(allowedScales(512, 512)).toEqual([2, 4, 8]);
+    expect(allowedScales(512, 512)).toEqual([2, 4]);   // phone budget: 6 MP
+    expect(allowedScales(300, 200)).toEqual([2, 4, 8]);
     expect(allowedScales(1200, 900)).toEqual([2]);
-    expect(allowedScales(5000, 4000)).toEqual([]);
+    expect(allowedScales(5000, 4000)).toEqual([2]);     // 2x is always offered, shrunk to fit
+    const d = outputDims(1170, 2532, 2);
+    expect(d.capped).toBe(true);
+    expect(d.W * d.H).toBeLessThanOrEqual(MAX_OUTPUT_PIXELS);
+    expect(d.W / d.H).toBeCloseTo(1170 / 2532, 2);
+    expect(outputDims(400, 300, 2)).toEqual({ W: 800, H: 600, capped: false });
     const f = fitPixels(8000, 6000, MAX_OUTPUT_PIXELS);
     expect(f.w * f.h).toBeLessThanOrEqual(MAX_OUTPUT_PIXELS);
     expect(f.w / f.h).toBeCloseTo(8000 / 6000, 2);
@@ -303,6 +309,18 @@ describe('end-to-end pipeline (CPU)', () => {
     expect([r.img.w, r.img.h]).toEqual([40, 40]);
     expect(r.models.join(' ')).toMatch(/no AI/);
   });
+
+  it('a capped 2x shrinks the input so the model output is the target size', async () => {
+    const { setOutputCap, MOBILE_OUTPUT_PIXELS } = await import('../src/engine/tiling');
+    setOutputCap(40 * 40 * 2);   // tiny budget for the test
+    try {
+      const src = crop(fixture('sharp'), 40, 40);
+      const r = await enhance(src, [], 2, plan(2, { texture: 0 }), 'ai', await rt(64), () => {});
+      expect(r.img.w * r.img.h).toBeLessThanOrEqual(3200);
+      expect(r.stages.join(' ')).toMatch(/Output limited to/);
+      expect(r.stages.join(' ')).toMatch(/Resized to fit the output limit/);
+    } finally { setOutputCap(MOBILE_OUTPUT_PIXELS); }
+  }, 60000);
 
   it('can be cancelled', async () => {
     const ctl = new AbortController(); ctl.abort();

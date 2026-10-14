@@ -2,7 +2,7 @@
 // (soft / moderate / crisp) because no-reference metrics are rough estimates.
 import type { Img } from './ops';
 import { luma, resample } from './ops';
-import { allowedScales, MAX_OUTPUT_PIXELS, MOBILE_OUTPUT_PIXELS, type Scale } from './tiling';
+import { allowedScales, type Scale } from './tiling';
 
 export interface FaceBox { x: number; y: number; w: number; h: number }
 export type Issue = 'heavy-blur' | 'compression' | 'noise' | 'soft' | 'low-res' | 'none';
@@ -150,9 +150,7 @@ export function recommendScale(w: number, h: number, eff = 1): Scale {
   let want: Scale = long <= 1400 ? 4 : 2;
   // a soft image has less real detail; enlarging it a lot mostly enlarges blur
   if (eff <= 0.7 && long > 400) want = 2;
-  // phones: keep the recommended result under 8 MP so it fits in browser memory
-  const budget = MAX_OUTPUT_PIXELS <= MOBILE_OUTPUT_PIXELS ? 8_000_000 : Infinity;
-  const fits = allowed.filter((s) => s <= want && (s === 2 || w * h * s * s <= budget));
+  const fits = allowed.filter((s) => s <= want);
   return fits.length ? fits[fits.length - 1] : 2;
 }
 

@@ -14,6 +14,10 @@ interface Props {
   cmd: ZoomCmd;
   onZoom: (z: number) => void;
   busy: boolean;
+  /** crop mode: drag draws a rectangle in stage pixels instead of panning */
+  cropMode?: boolean;
+  crop?: { x: number; y: number; w: number; h: number } | null;
+  onCrop?: (r: { x: number; y: number; w: number; h: number } | null) => void;
 }
 
 /**
@@ -32,7 +36,10 @@ export function Viewer(p: Props) {
   const paneRef = useRef<HTMLDivElement>(null);
   const size = useRef({ w: 1, h: 1 });
   const ptrs = useRef(new Map<number, { x: number; y: number }>());
-  const drag = useRef<{ kind: 'pan' | 'slider'; x: number; y: number; v: View; dist?: number } | null>(null);
+  const drag = useRef<{ kind: 'pan' | 'slider' | 'crop'; x: number; y: number; v: View; dist?: number } | null>(null);
+  const toStage = (pt: { x: number; y: number }) => ({
+    x: Math.min(W, Math.max(0, (pt.x - view.x) / view.z)), y: Math.min(H, Math.max(0, (pt.y - view.y) / view.z)),
+  });
 
   const fit = useCallback(() => {
     userZoomed.current = false;
@@ -76,7 +83,11 @@ export function Viewer(p: Props) {
     const pt = local(e);
     ptrs.current.set(e.pointerId, pt);
     const onHandle = (e.target as HTMLElement).closest('.handle');
-    if (ptrs.current.size === 2) {
+    if (p.cropMode && ptrs.current.size === 1) {
+      const a = toStage(pt);
+      drag.current = { kind: 'crop', x: a.x, y: a.y, v: view };
+      p.onCrop?.(null);
+    } else if (ptrs.current.size === 2) {
       const [a, b] = [...ptrs.current.values()];
       drag.current = { kind: 'pan', x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, v: view, dist: Math.hypot(a.x - b.x, a.y - b.y) };
     } else if (onHandle && p.mode === 'slider') {
@@ -91,6 +102,12 @@ export function Viewer(p: Props) {
     ptrs.current.set(e.pointerId, pt);
     const d = drag.current;
     if (d.kind === 'slider') { p.setFrac(sliderFraction(pt.x, view, W)); return; }
+    if (d.kind === 'crop') {
+      const b = toStage(pt);
+      const x = Math.min(d.x, b.x), y = Math.min(d.y, b.y);
+      p.onCrop?.({ x: Math.round(x), y: Math.round(y), w: Math.round(Math.abs(b.x - d.x)), h: Math.round(Math.abs(b.y - d.y)) });
+      return;
+    }
     userZoomed.current = true;
     if (ptrs.current.size === 2 && d.dist) {
       const [a, b] = [...ptrs.current.values()];
@@ -139,7 +156,7 @@ export function Viewer(p: Props) {
 
   const pane = (which: 'orig' | 'enh' | 'both', label: string | null, withRef: boolean) => (
     <div
-      className="pane" ref={withRef ? paneRef : undefined}
+      className={`pane${p.cropMode ? ' cropping' : ''}`} ref={withRef ? paneRef : undefined}
       onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
       onDoubleClick={onDouble}
     >
@@ -151,6 +168,11 @@ export function Viewer(p: Props) {
           </div>
         )}
       </div>
+      {p.cropMode && p.crop && p.crop.w > 0 && (
+        <div className="crop-rect" style={{ left: view.x + p.crop.x * view.z, top: view.y + p.crop.y * view.z, width: p.crop.w * view.z, height: p.crop.h * view.z }}>
+          <span>{p.crop.w} × {p.crop.h}</span>
+        </div>
+      )}
       {label && <span className="chip-label">{label}</span>}
       {which === 'both' && enh && (
         <div

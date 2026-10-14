@@ -154,6 +154,17 @@ const shown = Buffer.from(await pg.evaluate(async () => {
 check(png.w === 240 && createHash('sha256').update(saved).digest('hex') === createHash('sha256').update(shown).digest('hex'),
   `downloaded PNG is byte for byte the previewed image (${png.w} × ${png.h})`);
 
+// crop: drag a box on the original and enhance only that part
+await pg.click('.viewbar >> text=Crop');
+const cs = await pg.locator('.stage').boundingBox();
+await pg.mouse.move(cs.x + cs.width * 0.25, cs.y + cs.height * 0.25);
+await pg.mouse.down();
+await pg.mouse.move(cs.x + cs.width * 0.75, cs.y + cs.height * 0.75, { steps: 6 });
+await pg.mouse.up();
+await pg.click('text=Apply crop');
+await pg.waitForFunction(() => /This image is 6\d × 4\d pixels/.test(document.querySelector('.summary')?.textContent || ''), null, { timeout: 30000 });
+check(true, 'crop applied: ' + (await pg.textContent('.summary')).slice(0, 40));
+
 // invalid upload is rejected with a clear message
 await pg.setInputFiles('#file', { name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('this is not an image at all') });
 await pg.waitForSelector('.alert');

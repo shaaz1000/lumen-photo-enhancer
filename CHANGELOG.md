@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-14
+
+### Fixed
+
+* Enhance failing on phones. Large phone photos ran out of browser memory: iOS limits canvas memory per page and kills or blanks tabs that use too much.
+  * The preview now shows image elements backed by the exported PNG instead of extra canvases, and canvases are released right after use.
+  * Tiles are blended straight into the output bytes, dropping two full-size float buffers.
+  * On phones, photos over 0.3 megapixels use the fast model unless Maximum Detail is chosen, the second texture pass is skipped for large outputs, and the recommended scale keeps results under 8 MP.
+  * The deep model uses larger tiles on phones (less wasted overlap) and the GPU texture pool is capped.
+* A lost GPU context (the browser resetting WebGL under memory pressure) is now reported with a clear message instead of producing a broken result.
+
+### Added
+
+* Progress shows an estimated time left.
+* The downloaded PNG is byte for byte the image shown in the preview (checked by the end-to-end test).
+
 ## [1.1.0] - 2026-10-14
 
 Real restoration instead of mild upscaling. 1.0.0 did run Real-ESRGAN, but its small model plus finishing steps that pulled the result back toward plain bicubic made many outputs look almost unchanged.

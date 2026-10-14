@@ -63,7 +63,10 @@ export async function runSr(model: SrModel, img: Img, o: RunOpts): Promise<Img> 
   const f = s / o.outFactor;
   if (!Number.isInteger(f) || f < 1) throw new Error('Unsupported output factor.');
   const W = Math.round(img.w * o.outFactor), H = Math.round(img.h * o.outFactor);
-  const acc = new Float32Array(W * H * 3), wsum = new Float32Array(W * H);
+  // Ramps of neighbouring tiles sum to exactly 1, so weighted values can be added
+  // straight into the output bytes: no float buffers, which matters on phones.
+  const out = makeImg(W, H);
+  const o8 = out.data;
   for (const t of planFeatherTiles(img.w, img.h, o.tile, model.feather, model.pad)) {
     if (o.signal?.aborted) throw new Cancelled();
     const pw = t.px1 - t.px0, ph = t.py1 - t.py0;
@@ -79,6 +82,7 @@ export async function runSr(model: SrModel, img: Img, o: RunOpts): Promise<Img> 
     const sx0 = (t.ex0 - t.px0) * s, sy0 = (t.ey0 - t.py0) * s;
     const dx0 = t.ex0 * o.outFactor, dy0 = t.ey0 * o.outFactor;
     const inv = 1 / (f * f);
+    for (let i = 0; i < y.length; i += 97) if (y[i] !== y[i]) throw new Error(`${model.name} produced invalid pixels. Your GPU may not support this model; try the Faithful setting.`);
     for (let yy = 0; yy < oh; yy++) {
       const dRow = (dy0 + yy) * W;
       for (let xx = 0; xx < ow; xx++) {
@@ -87,22 +91,12 @@ export async function runSr(model: SrModel, img: Img, o: RunOpts): Promise<Img> 
           const q = ((sy0 + yy * f + j) * srcW + sx0 + xx * f + i) * 3;
           r += y[q]; g += y[q + 1]; b += y[q + 2];
         }
-        const wt = wx[xx] * wy[yy], di = dRow + dx0 + xx;
-        acc[di * 3] += r * inv * wt; acc[di * 3 + 1] += g * inv * wt; acc[di * 3 + 2] += b * inv * wt;
-        wsum[di] += wt;
+        const k = inv * wx[xx] * wy[yy] * 255, di = (dRow + dx0 + xx) * 4;
+        o8[di] += r * k; o8[di + 1] += g * k; o8[di + 2] += b * k; o8[di + 3] = 255;
       }
     }
     o.onTile?.();
     if (o.yieldFn) await o.yieldFn();
   }
-  const out = makeImg(W, H);
-  let bad = 0;
-  for (let i = 0; i < W * H; i++) {
-    const k = wsum[i] > 0 ? 255 / wsum[i] : 0;
-    const r = acc[i * 3] * k, g = acc[i * 3 + 1] * k, b = acc[i * 3 + 2] * k;
-    if (!(r === r && g === g && b === b)) bad++; // NaN check
-    out.data[i * 4] = r; out.data[i * 4 + 1] = g; out.data[i * 4 + 2] = b; out.data[i * 4 + 3] = 255;
-  }
-  if (bad > W * H * 0.001) throw new Error(`${model.name} produced invalid pixels. Your GPU may not support this model; try the Faithful setting.`);
   return out;
 }

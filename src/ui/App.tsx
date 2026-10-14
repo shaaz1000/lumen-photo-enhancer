@@ -13,8 +13,8 @@ import { exportSizes, formatBytes } from './viewMath';
 import { makeSample } from './sample';
 import { saveFile } from './save';
 
-interface Source { img: Img; canvas: HTMLCanvasElement; name: string; bytes: number; format: string; sample: boolean }
-interface Done { canvas: HTMLCanvasElement; img: Img; engine: EngineKind; stages: string[]; models: string[]; ms: number; params: Params; mode: ModeId; srKey: string; plan: Plan }
+interface Source { img: Img; url: string; name: string; bytes: number; format: string; sample: boolean }
+interface Done { url: string; png: Blob; img: Img; engine: EngineKind; stages: string[]; models: string[]; ms: number; params: Params; mode: ModeId; srKey: string; plan: Plan }
 type RtState = { status: 'loading' } | { status: 'ready'; rt: Runtime; info: RuntimeInfo } | { status: 'failed'; info: RuntimeInfo };
 
 const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -45,6 +45,9 @@ export function App() {
   const abort = useRef<AbortController | null>(null);
   const rtPromise = useRef<Promise<RtState> | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => () => { if (src) URL.revokeObjectURL(src.url); }, [src]);
+  useEffect(() => () => { if (done) URL.revokeObjectURL(done.url); }, [done]);
 
   /* ---------- runtime ---------- */
   useEffect(() => {
@@ -83,7 +86,7 @@ export function App() {
     if (dimErr) { setError(dimErr); return; }
     abort.current?.abort();
     srCache.current = null;
-    const s: Source = { ...decoded, name, bytes: blob.size, format: v.format, sample };
+    const s: Source = { img: decoded.img, url: URL.createObjectURL(blob), name, bytes: blob.size, format: v.format, sample };
     setSrc(s); setDone(null); setJob(null); setFaces(null); setAnalysis(null); setAnalyzing(true);
     setFrac(0.5); setCmd((c) => ({ kind: 'fit', n: c.n + 1 }));
     // first pass without faces so the summary appears immediately
@@ -92,7 +95,8 @@ export function App() {
     setMode(a0.recommendedMode); setParams((p) => paramsFor(a0.recommendedMode, a0, a0.recommendedScale, p.fidelity));
     const state = await rtPromise.current;
     let boxes: Box[] | null = null;
-    if (state?.status === 'ready') boxes = await detectFaces(s.canvas);
+    if (state?.status === 'ready') boxes = await detectFaces(decoded.canvas);
+    decoded.canvas.width = decoded.canvas.height = 0; // release canvas memory (iOS caps it per page)
     const a1 = analyze(s.img, s.bytes, s.format, boxes);
     setFaces(boxes); setAnalysis(a1); setAnalyzing(false); setFaceIdx(0);
     setMode(a1.recommendedMode); setParams((p) => paramsFor(a1.recommendedMode, a1, a1.recommendedScale, p.fidelity));
@@ -107,6 +111,7 @@ export function App() {
     deepOk: engine === 'server' || (rt.status === 'ready' && rt.info.deepOk),
     server: engine === 'server',
     faceRestoreOk: engine === 'server' && !!server?.faceModel,
+    mobile: rt.status === 'ready' ? rt.info.mobile : rt.status === 'failed' ? rt.info.mobile : false,
   };
   const plan = planFor(params, mode, analysis, caps);
   const key = src ? srKey(params.scale, plan, engine, faceList) : '';
@@ -136,10 +141,14 @@ export function App() {
         srCache.current = sr;
       }
       const fin = await finish(src.img, sr.rec, faceList, plan, engine, prog, ctl.signal);
-      // the preview and the download both come from this canvas
+      // Encode once: the preview shows these PNG bytes and Download saves the same bytes.
+      prog({ stage: 'Preparing preview' });
       const canvas = imgToCanvas(fin.img);
+      const png = await encode(canvas, 'png', 1);
+      canvas.width = canvas.height = 0;
+      const url = URL.createObjectURL(png);
       const first = !done;
-      setDone({ canvas, img: fin.img, engine, stages: [...sr.rec.stages, ...fin.stages], models: sr.rec.models,
+      setDone({ url, png, img: fin.img, engine, stages: [...sr.rec.stages, ...fin.stages], models: sr.rec.models,
         ms: performance.now() - t0,
         params: { ...params }, mode, srKey: key, plan });
       setJob(null);
@@ -198,7 +207,7 @@ export function App() {
           {src ? (
             <>
               <Viewer
-                original={src.canvas} enhanced={done?.canvas ?? null}
+                original={src.url} enhanced={done?.url ?? null}
                 width={done ? done.img.w : src.img.w} height={done ? done.img.h : src.img.h}
                 mode={viewMode} frac={frac} setFrac={setFrac} cmd={cmd} onZoom={setZoom} busy={busy}
               />
@@ -298,7 +307,7 @@ export function App() {
                 </div>
                 <p className={`note${params.fidelity === 'max' ? ' caution' : ''}`}>{FIDELITY.find((f) => f.id === params.fidelity)!.note}</p>
                 {engine !== 'classic' && <p className="note">Model: <b>{plan.model === 'deep' ? 'Real-ESRGAN x4plus (deep, 16.7 M parameters)' : 'Real-ESRGAN general v3 (fast, 1.2 M parameters)'}</b>{plan.preShrink < 1 ? ` · detail matched at ${Math.round(plan.preShrink * 100)}%` : ''}</p>}
-                {plan.notes.filter((n) => n.startsWith('Deep model needs')).map((n) => <p key={n} className="note caution">{n}</p>)}
+                {plan.notes.filter((n) => /^(Deep model|On phones|Texture mixing is skipped)/.test(n)).map((n) => <p key={n} className="note caution">{n}</p>)}
               </Field>
               <Field label="Upscale">
                 <div className="seg full" role="radiogroup" aria-label="Upscale factor">
@@ -352,7 +361,7 @@ export function App() {
                 {done.stages.map((m, i) => <li key={i}>{m}</li>)}
                 <li>{(done.ms / 1000).toFixed(1)} s{fastApply ? ' (finishing only; reconstruction reused)' : ''}</li>
               </ul>
-              {done.plan.notes.filter((n) => !n.startsWith('Deep model needs')).map((n) => <p key={n} className="note">{n}</p>)}
+              {done.plan.notes.filter((n) => !/^(Deep model needs|On phones|Texture mixing is skipped)/.test(n)).map((n) => <p key={n} className="note">{n}</p>)}
             </section>
           )}
         </aside>
@@ -397,7 +406,7 @@ function ProgressOverlay({ job, onCancel }: { job: Progress; onCancel: () => voi
     <div className="progress" role="status" aria-live="polite">
       <div className="progress-text">
         <span>{job.stage}</span>
-        {det && <span className="count">{job.done} of {job.total} tiles</span>}
+        {det && <span className="count">{job.done} of {job.total} tiles{job.eta != null && job.eta > 5 ? ` · about ${job.eta > 90 ? `${Math.round(job.eta / 60)} min` : `${Math.round(job.eta)} s`} left` : ''}</span>}
       </div>
       <div className={`track${det ? '' : ' indet'}`}><div className="fill" style={det ? { width: `${(job.done! / job.total!) * 100}%` } : undefined} /></div>
       <button className="btn small" onClick={onCancel}>Cancel</button>
@@ -463,8 +472,12 @@ function ExportCard({ done, src }: { done: Done; src: Source }) {
     let live = true; setPending(true); setBlob(null);
     const t = setTimeout(async () => {
       try {
-        const canvas = size.id === 'full' ? done.canvas : imgToCanvas(resample(done.img, size.w, size.h));
-        const b = await encode(canvas, fmt, q);
+        let b: Blob;
+        if (size.id === 'full' && fmt === 'png') b = done.png;
+        else {
+          const canvas = imgToCanvas(size.id === 'full' ? done.img : resample(done.img, size.w, size.h));
+          try { b = await encode(canvas, fmt, q); } finally { canvas.width = canvas.height = 0; }
+        }
         if (live) { setBlob(b); setPending(false); }
       } catch (e) { if (live) { setMsg((e as Error).message); setPending(false); } }
     }, 350);

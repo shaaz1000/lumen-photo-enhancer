@@ -72,7 +72,7 @@ export interface Plan {
   notes: string[];
 }
 
-export interface Caps { deepOk: boolean; server: boolean; faceRestoreOk: boolean }
+export interface Caps { deepOk: boolean; server: boolean; faceRestoreOk: boolean; /** phone or tablet running in the browser */ mobile?: boolean }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -82,6 +82,14 @@ export function planFor(p: Params, mode: ModeId, a: Analysis | null, caps: Caps)
   let model: ModelKind = wantDeep && caps.deepOk ? 'deep' : 'general';
   if (wantDeep && !caps.deepOk) notes.push('Deep model needs GPU acceleration, which is not available here, so the fast model was used.');
   if (p.fidelity === 'faithful') model = 'general';
+  // Phones: the deep model on a large photo needs minutes and more memory than
+  // many phones give a browser tab, so it only runs there when asked for explicitly.
+  const px = a ? a.w * a.h : 0;
+  const phone = !!caps.mobile && !caps.server;
+  if (phone && model === 'deep' && px > 300_000) {
+    if (p.fidelity === 'max') notes.push('Deep model on a phone: this can take several minutes and may run out of memory on large photos.');
+    else { model = 'general'; notes.push('On phones, photos over 0.3 megapixels use the fast model to stay within memory. Choose Maximum Detail to force the deep model (slow).'); }
+  }
 
   // Effective detail scale: a soft 1000 px image may only hold 600 px of detail.
   const eff = a?.effectiveScale ?? 1;
@@ -98,6 +106,9 @@ export function planFor(p: Params, mode: ModeId, a: Analysis | null, caps: Caps)
   let textureMix = p.texture * [0.8, 0.5, 0.25][fid];
   if (model === 'deep') textureMix += (1 - p.denoise) * 0.3;
   textureMix = clamp(textureMix, 0, 0.8);
+  // the texture source is a second full model run; skip it for big phone outputs
+  const skipWeak = phone && px * p.scale * p.scale > 4_000_000;
+  if (skipWeak) { textureMix = 0; notes.push('Texture mixing is skipped on phones for large outputs to save memory.'); }
 
   const sharpen = p.sharpness * [0.6, 1, 1.4][fid] * (model === 'deep' ? 0.7 : 1);
   const color = p.color * [0.6, 1, 1.1][fid];
@@ -108,7 +119,7 @@ export function planFor(p: Params, mode: ModeId, a: Analysis | null, caps: Caps)
   return {
     model, dni: p.denoise, preShrink: f, textureMix,
     // with generative restoration on, faces keep the restored detail instead of extra grain
-    faceTextureBoost: faceRestore > 0 ? 0 : 0.25 * p.faceProtect, faceSharpenCut: 0.6 * p.faceProtect,
+    faceTextureBoost: faceRestore > 0 || skipWeak ? 0 : 0.25 * p.faceProtect, faceSharpenCut: 0.6 * p.faceProtect,
     sharpen, color, faceRestore, notes,
   };
 }

@@ -39,6 +39,21 @@ export async function initRuntime(): Promise<{ rt: Runtime | null; info: Runtime
   let maxTex = 4096;
   try { maxTex = (tf.env().getNumber('WEBGL_MAX_TEXTURE_SIZE') as number) || 4096; } catch { /* cpu */ }
   const gpu = backend === 'webgl';
+  // Free GPU textures instead of pooling them once usage passes this size; phones have little to spare.
+  if (gpu) try { tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', mobile ? 128 * 1024 * 1024 : 1024 * 1024 * 1024); } catch { /* older tfjs */ }
+  // Phones drop the WebGL context when memory runs out; after that every result is garbage.
+  let lost = false;
+  try { (tf.backend() as any).gpgpu?.gl?.canvas?.addEventListener('webglcontextlost', () => { lost = true; }); } catch { /* not webgl */ }
+  const LOST = 'The GPU was reset by the browser, usually because it ran out of memory. Reload the page, then try Faithful, 2× or a smaller image.';
+  const guard = (m: SrModel): SrModel => ({
+    ...m,
+    async infer(d, h, w) {
+      if (lost) throw new Error(LOST);
+      const y = await m.infer(d, h, w);
+      if (lost) throw new Error(LOST);
+      return y;
+    },
+  });
   const tiles: Record<ModelKind, number> = {
     general: gpu ? chooseTileSize(mobile, maxTex) : 96,
     deep: gpu ? chooseTileSize(mobile, maxTex, true) : 48,
@@ -70,13 +85,13 @@ export async function initRuntime(): Promise<{ rt: Runtime | null; info: Runtime
         deepWeights ??= Promise.all(DEEP_PARTS.map(fetchBin)).then((parts) => parseWeights(concatParts(parts)));
         let w: ModelWeights;
         try { w = await deepWeights; } catch (e) { deepWeights = null; throw new Error(`The deep model could not be downloaded: ${(e as Error).message}`); }
-        return keep('deep', buildRrdb(tf, w));
+        return keep('deep', guard(buildRrdb(tf, w)));
       }
       const key = `g${Math.round(dni * 20) / 20}`;
       const hit = cache.get(key);
       if (hit) return hit;
       const [strong, weak] = await general!;
-      return keep(key, buildSrvgg(tf, blendWeights(strong, weak, Math.round(dni * 20) / 20)));
+      return keep(key, guard(buildSrvgg(tf, blendWeights(strong, weak, Math.round(dni * 20) / 20))));
     },
   };
   return { rt, info: { backend, gpu, mobile, tile: tiles.general, deepOk: gpu } };

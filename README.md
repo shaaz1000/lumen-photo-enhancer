@@ -5,9 +5,9 @@
 **Turn blurry screenshots, compressed Instagram saves and soft video frames into clearer, higher resolution photos.**
 Real-ESRGAN restoration running privately in your browser, with an optional server for generative face restoration.
 
-![version](https://img.shields.io/badge/version-1.1.0-2f5bd3)
+![version](https://img.shields.io/badge/version-1.1.1-2f5bd3)
 ![license](https://img.shields.io/badge/license-MIT-237a4b)
-![tests](https://img.shields.io/badge/tests-78%20passing-237a4b)
+![tests](https://img.shields.io/badge/tests-79%20passing-237a4b)
 ![privacy](https://img.shields.io/badge/images-never%20uploaded-6b7280)
 
 <img src="docs/benchmark/social_screenshot.png" alt="Crops of a degraded cat photo: input, bicubic, version 1.0, Faithful, Deep Restoration, Maximum Detail and the clean reference" width="860">
@@ -245,7 +245,7 @@ curl -F image=@photo.jpg -F scale=2 -F model=deep http://localhost:8000/api/enha
 ## Testing
 
 ```sh
-npm test                         # 56 tests: models, pipeline, analysis, tiling, viewer maths
+npm test                         # 57 tests: models, pipeline, analysis, tiling, viewer maths
 npm run typecheck
 cd backend && pytest -q          # 22 tests: API, validation, rate limits, ONNX parity, real engine
 CHROME=/path/to/chrome npm run test:e2e   # real WebGL run of both models, slider, zoom, export
@@ -271,7 +271,7 @@ To compare against 1.0, check it out with `git worktree add ../v1 v1.0.0` and pa
 * AI restoration adds plausible detail. It cannot recover what the camera never captured. Do not use results as evidence or for identification.
 * Strong focus and motion blur are detected and reported, not fixed.
 * Generative face restoration can shift likeness. It is off by default and limited by the strength slider.
-* The deep model is slow on phones and may exceed the GPU memory of older devices; the app then reports an error and suggests Faithful.
+* On phones, photos over 0.3 megapixels use the fast model by default to stay within memory; Maximum Detail forces the deep model, which can take several minutes there.
 * Face identity was checked on one public domain portrait only.
 
 ## Project layout

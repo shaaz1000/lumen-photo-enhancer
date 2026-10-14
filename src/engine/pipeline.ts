@@ -27,7 +27,7 @@ export interface ServerRequest { scale: number; model: ModelKind; dni: number; p
 export interface ServerResult { primary: Img; weak: Img | null; info: string[] }
 export type ServerSr = (src: Img, req: ServerRequest, signal?: AbortSignal) => Promise<ServerResult>;
 
-export interface Progress { stage: string; done?: number; total?: number }
+export interface Progress { stage: string; done?: number; total?: number; /** seconds left, estimated from finished tiles */ eta?: number }
 
 export interface Reconstruction { primary: Img; weak: Img | null; stages: string[]; models: string[]; ms: number }
 export interface Result { img: Img; engine: EngineKind; stages: string[]; models: string[]; ms: number }
@@ -87,14 +87,19 @@ export async function reconstruct(
   if (!rt) throw new Error('The AI engine is not loaded.');
   const primaryTile = rt.tile(plan.model), weakTile = rt.tile('general');
   const total = countTiles(input.w, input.h, primaryTile) + (needWeak ? countTiles(input.w, input.h, weakTile) : 0);
-  let done = 0;
-  const onTile = () => onProgress({ stage: 'Reconstructing detail', done: ++done, total });
+  let done = 0, tStart = 0;
+  const onTile = () => {
+    done++;
+    const el = (performance.now() - tStart) / 1000;
+    onProgress({ stage: 'Reconstructing detail', done, total, eta: done >= 2 ? (el / done) * (total - done) : undefined });
+  };
 
   // Stage 2: reconstruct
   onProgress({ stage: plan.model === 'deep' ? 'Loading deep model (33 MB, first time only)' : 'Loading model' });
   const model = await rt.getModel(plan.model, plan.dni);
   check();
   onProgress({ stage: 'Reconstructing detail', done: 0, total });
+  tStart = performance.now();
   let primary = await runSr(model, input, { tile: primaryTile, outFactor, signal, onTile, yieldFn: tick });
   models.push(model.name + (plan.model === 'general' ? ` (denoise ${Math.round(plan.dni * 100)}%)` : ''));
   stages.push(`AI reconstruction ${outFactor}× with ${model.name} on ${rt.backend}`);
@@ -134,7 +139,7 @@ export async function finish(
 
   if (plan.color > 0.01) {
     onProgress({ stage: 'Correcting colour' }); await tick(); check();
-    out = applyColor(out, planColor(src), plan.color);
+    out = applyColor(out, planColor(src), plan.color, out !== rec.primary); // in place when out is already a copy
     stages.push(`Colour correction ${Math.round(plan.color * 100)}%`);
   }
 

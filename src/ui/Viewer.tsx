@@ -5,8 +5,8 @@ export type ViewMode = 'slider' | 'side' | 'original' | 'enhanced';
 export interface ZoomCmd { kind: 'fit' | 'pixel' | 'in' | 'out' | 'level' | 'rect'; n: number; /** level: 1 = 100% */ value?: number; rect?: { x: number; y: number; w: number; h: number } }
 
 interface Props {
-  original: HTMLCanvasElement;
-  enhanced: HTMLCanvasElement | null;
+  original: string;
+  enhanced: string | null;
   /** logical size of the comparison space (enhanced size, or original if none) */
   width: number; height: number;
   mode: ViewMode;
@@ -16,14 +16,13 @@ interface Props {
   busy: boolean;
 }
 
-/** Copies a source canvas into a display canvas mounted inside the stage. */
-function Layer({ src, cls, pixelated }: { src: HTMLCanvasElement; cls: string; pixelated?: boolean }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useLayoutEffect(() => {
-    const c = ref.current!; c.width = src.width; c.height = src.height;
-    c.getContext('2d')!.drawImage(src, 0, 0);
-  }, [src]);
-  return <canvas ref={ref} className={`layer ${cls}${pixelated ? ' pixelated' : ''}`} aria-hidden="true" />;
+/**
+ * Shows an image from an object URL. Images, unlike canvases, do not count
+ * toward iOS Safari's canvas memory limit, and the enhanced URL points at the
+ * exact PNG bytes that Download saves.
+ */
+function Layer({ src, cls, pixelated }: { src: string; cls: string; pixelated?: boolean }) {
+  return <img src={src} alt="" draggable={false} className={`layer ${cls}${pixelated ? ' pixelated' : ''}`} aria-hidden="true" />;
 }
 
 export function Viewer(p: Props) {

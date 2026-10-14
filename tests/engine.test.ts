@@ -224,6 +224,18 @@ describe('presets and planning', () => {
     expect(p.model).toBe('general');
     expect(p.notes[0]).toMatch(/GPU/);
   });
+  it('phones use the fast model for large photos unless Maximum Detail is chosen', () => {
+    const big = { ...analyze(fixture('soft'), meta.soft.bytes, 'PNG', []), w: 1170, h: 2532 };
+    const phone = { ...caps, mobile: true };
+    const bal = planFor(paramsFor('deep', big, 2), 'deep', big, phone);
+    expect(bal.model).toBe('general');
+    expect(bal.notes.join(' ')).toMatch(/On phones/);
+    expect(bal.textureMix).toBe(0);
+    expect(planFor(paramsFor('deep', big, 2, 'max'), 'deep', big, phone).model).toBe('deep');
+    const small = { ...big, w: 500, h: 500 };
+    expect(planFor(paramsFor('deep', small, 2), 'deep', small, phone).model).toBe('deep');
+    expect(planFor(paramsFor('deep', big, 2), 'deep', big, caps).model).toBe('deep');
+  });
   it('face restoration only when the server offers it', () => {
     const p = paramsFor('deep', null, 2);
     expect(planFor(p, 'deep', null, caps).faceRestore).toBe(0);

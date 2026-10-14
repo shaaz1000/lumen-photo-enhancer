@@ -98,7 +98,7 @@ async function enhance(label) {
   await pg.waitForSelector('.progress', { state: 'detached', timeout: 1800000 });
   const err = await pg.locator('.alert[role=alert]').textContent().catch(() => null);
   if (err) { check(false, `${label}: ${err}`); return null; }
-  const dims = await pg.evaluate(() => [...document.querySelectorAll('canvas.layer')].map((x) => [x.width, x.height]));
+  const dims = await pg.evaluate(async () => { const ims = [...document.querySelectorAll('img.layer')]; await Promise.all(ims.map((i) => i.decode().catch(() => {}))); return ims.map((x) => [x.naturalWidth, x.naturalHeight]); });
   const report = await pg.locator('.card.quiet').textContent();
   console.log(`  ${label}: ${((Date.now() - t0) / 1000).toFixed(1)} s, canvases ${JSON.stringify(dims)}`);
   return { dims, report };
@@ -145,16 +145,14 @@ await pg.click('.zoom >> text=Fit');
 await pg.waitForFunction(() => /\d+(\.\d)? (KB|MB|B)/.test(document.querySelectorAll('.facts.two dd')[1]?.textContent || ''), null, { timeout: 30000 });
 const [dl] = await Promise.all([pg.waitForEvent('download', { timeout: 30000 }), pg.click('text=Download PNG')]);
 const file = await dl.path();
-const png = pngRgb(readFileSync(file));
-const shown = await pg.evaluate(() => {
-  const c = document.querySelector('canvas.layer.enh');
-  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
-  const rgb = new Array(c.width * c.height * 3);
-  for (let i = 0, j = 0; i < d.length; i += 4) { rgb[j++] = d[i]; rgb[j++] = d[i + 1]; rgb[j++] = d[i + 2]; }
-  return { w: c.width, h: c.height, rgb };
-});
-const h1 = createHash('sha256').update(png.rgb).digest('hex'), h2 = createHash('sha256').update(Buffer.from(shown.rgb)).digest('hex');
-check(png.w === shown.w && png.h === shown.h && h1 === h2, `downloaded PNG equals the preview pixel for pixel (${png.w} × ${png.h})`);
+const saved = readFileSync(file);
+const png = pngRgb(saved);
+const shown = Buffer.from(await pg.evaluate(async () => {
+  const r = await fetch(document.querySelector('img.layer.enh').src);
+  return [...new Uint8Array(await r.arrayBuffer())];
+}));
+check(png.w === 240 && createHash('sha256').update(saved).digest('hex') === createHash('sha256').update(shown).digest('hex'),
+  `downloaded PNG is byte for byte the previewed image (${png.w} × ${png.h})`);
 
 // invalid upload is rejected with a clear message
 await pg.setInputFiles('#file', { name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('this is not an image at all') });

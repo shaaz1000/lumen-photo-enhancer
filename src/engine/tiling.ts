@@ -28,7 +28,7 @@ export function planTiles(width: number, height: number, tile: number, pad: numb
 
 /** Picks a tile size that keeps activation memory bounded on phones and laptops. */
 export function chooseTileSize(isMobile: boolean, maxTextureSize: number, deep = false): number {
-  const base = deep ? (isMobile ? 64 : 128) : isMobile ? 128 : 192;
+  const base = deep ? (isMobile ? 96 : 128) : isMobile ? 128 : 192;
   return Math.max(64, Math.min(base, Math.floor(maxTextureSize / 16)));
 }
 

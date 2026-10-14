@@ -189,7 +189,7 @@ export function planColor(img: Img): ColorPlan {
   return { gains, black, white, gamma };
 }
 
-export function applyColor(img: Img, plan: ColorPlan, strength: number): Img {
+export function applyColor(img: Img, plan: ColorPlan, strength: number, inPlace = false): Img {
   if (strength <= 0) return img;
   const luts = [0, 1, 2].map((c) => {
     const lut = new Uint8ClampedArray(256);
@@ -201,7 +201,7 @@ export function applyColor(img: Img, plan: ColorPlan, strength: number): Img {
     }
     return lut;
   });
-  const out = makeImg(img.w, img.h), d = img.data, o = out.data;
+  const out = inPlace ? img : makeImg(img.w, img.h), d = img.data, o = out.data;
   for (let p = 0; p < d.length; p += 4) {
     o[p] = luts[0][d[p]]; o[p + 1] = luts[1][d[p + 1]]; o[p + 2] = luts[2][d[p + 2]]; o[p + 3] = d[p + 3];
   }

@@ -242,6 +242,17 @@ describe('presets and planning', () => {
     expect(planFor(paramsFor('deep', small, 2), 'deep', small, phone).model).toBe('deep');
     expect(planFor(paramsFor('deep', big, 2), 'deep', big, caps).model).toBe('deep');
   });
+  it('picks the fast model when the deep one would take minutes on this device', () => {
+    const a = { ...analyze(fixture('soft'), meta.soft.bytes, 'PNG', []), w: 1000, h: 1000 };
+    const slow = { ...caps, secPerPx: 1e-5, overhead: { general: 1.5, deep: 2.8 } };   // a slow laptop GPU
+    const p = planFor(paramsFor('deep', a, 2), 'deep', a, slow);
+    expect(p.model).toBe('general');
+    expect(p.notes.join(' ')).toMatch(/would take about \d+ min/);
+    expect(p.estSeconds).toBeGreaterThan(0);
+    expect(planFor(paramsFor('deep', a, 2, 'max'), 'deep', a, slow).model).toBe('deep');
+    const fast = { ...slow, secPerPx: 1e-8 };
+    expect(planFor(paramsFor('deep', a, 2), 'deep', a, fast).model).toBe('deep');
+  });
   it('face restoration only when the server offers it', () => {
     const p = paramsFor('deep', null, 2);
     expect(planFor(p, 'deep', null, caps).faceRestore).toBe(0);

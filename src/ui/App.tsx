@@ -19,6 +19,7 @@ type RtState = { status: 'loading' } | { status: 'ready'; rt: Runtime; info: Run
 
 const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const pct = (v: number) => `${Math.round(v * 100)}%`;
+const fmtTime = (s: number) => (s < 10 ? 'a few seconds' : s < 90 ? `about ${Math.round(s / 5) * 5} s` : `about ${Math.round(s / 60)} min`);
 const ISSUE: Record<string, string> = { 'heavy-blur': 'strong blur', compression: 'compression', noise: 'noise', soft: 'softness', 'low-res': 'low resolution', none: 'none' };
 
 export function App() {
@@ -66,7 +67,12 @@ export function App() {
       if (f) { e.preventDefault(); loadBlob(f, f.name || 'pasted-image.png'); }
     };
     window.addEventListener('paste', onPaste);
-    return () => window.removeEventListener('paste', onPaste);
+    // anything that fails outside a handled path still gets reported on screen
+    const onErr = (e: ErrorEvent) => { setJob(null); setError(`Unexpected error: ${e.message}`); };
+    const onRej = (e: PromiseRejectionEvent) => { setJob(null); setError(`Unexpected error: ${(e.reason && (e.reason.message || String(e.reason))) || 'unknown'}`); };
+    window.addEventListener('error', onErr);
+    window.addEventListener('unhandledrejection', onRej);
+    return () => { window.removeEventListener('paste', onPaste); window.removeEventListener('error', onErr); window.removeEventListener('unhandledrejection', onRej); };
   }, []);
 
   /* ---------- loading ---------- */
@@ -114,6 +120,8 @@ export function App() {
     server: engine === 'server',
     faceRestoreOk: engine === 'server' && !!server?.faceModel,
     mobile: rt.status === 'ready' ? rt.info.mobile : rt.status === 'failed' ? rt.info.mobile : false,
+    secPerPx: rt.status === 'ready' && engine === 'ai' ? rt.info.secPerPx : undefined,
+    overhead: rt.status === 'ready' ? rt.info.overhead : undefined,
   };
   const plan = planFor(params, mode, analysis, caps);
   const key = src ? srKey(params.scale, plan, engine, faceList) : '';
@@ -168,7 +176,10 @@ export function App() {
       }
     } catch (e) {
       setJob(null);
-      if (!(e instanceof Cancelled) && (e as Error).name !== 'AbortError') setError((e as Error).message || 'Enhancement failed.');
+      if (!(e instanceof Cancelled) && (e as Error).name !== 'AbortError') {
+        console.error(e);
+        setError((e as Error).message || 'Enhancement failed.');
+      }
     }
   };
 
@@ -333,7 +344,7 @@ export function App() {
                 </div>
                 <p className={`note${params.fidelity === 'max' ? ' caution' : ''}`}>{FIDELITY.find((f) => f.id === params.fidelity)!.note}</p>
                 {engine !== 'classic' && <p className="note">Model: <b>{plan.model === 'deep' ? 'Real-ESRGAN x4plus (deep, 16.7 M parameters)' : 'Real-ESRGAN general v3 (fast, 1.2 M parameters)'}</b>{plan.preShrink < 1 ? ` · detail matched at ${Math.round(plan.preShrink * 100)}%` : ''}</p>}
-                {plan.notes.filter((n) => /^(Deep model|On phones|Texture mixing is skipped)/.test(n)).map((n) => <p key={n} className="note caution">{n}</p>)}
+                {plan.notes.filter((n) => /^(Deep model|On phones|Texture mixing is skipped|The deep model would take)/.test(n)).map((n) => <p key={n} className="note caution">{n}</p>)}
               </Field>
               <Field label="Upscale">
                 <div className="seg full" role="radiogroup" aria-label="Upscale factor">
@@ -369,6 +380,7 @@ export function App() {
               <button className="btn primary wide" disabled={busy || !dirty || cropping} onClick={run}>
                 {busy ? 'Working…' : !done ? `Enhance ${params.scale}×` : dirty ? (fastApply ? 'Apply changes' : `Re-enhance ${params.scale}×`) : 'Up to date'}
               </button>
+              {plan.estSeconds !== undefined && dirty && <p className="fine">Estimated time on this device: {fmtTime(plan.estSeconds)}{plan.model === 'deep' ? ', plus a one-time 33 MB download' : ''}.</p>}
               <p className="fine">{engine === 'server' ? 'Your image is sent to your server for processing and is not stored there.' : 'Processing runs on this device. Your image is never uploaded.'}</p>
             </section>
           )}
@@ -387,7 +399,7 @@ export function App() {
                 {done.stages.map((m, i) => <li key={i}>{m}</li>)}
                 <li>{(done.ms / 1000).toFixed(1)} s{fastApply ? ' (finishing only; reconstruction reused)' : ''}</li>
               </ul>
-              {done.plan.notes.filter((n) => !/^(Deep model needs|On phones|Texture mixing is skipped)/.test(n)).map((n) => <p key={n} className="note">{n}</p>)}
+              {done.plan.notes.filter((n) => !/^(Deep model needs|On phones|Texture mixing is skipped|The deep model would take)/.test(n)).map((n) => <p key={n} className="note">{n}</p>)}
             </section>
           )}
         </aside>
@@ -428,6 +440,12 @@ function Range({ id, label, value, onChange, left, right }: { id: string; label:
 
 function ProgressOverlay({ job, onCancel }: { job: Progress; onCancel: () => void }) {
   const det = job.total != null && job.done != null && job.total > 0;
+  const [stalled, setStalled] = useState(false);
+  useEffect(() => {
+    setStalled(false);
+    const t = setTimeout(() => setStalled(true), 45000);
+    return () => clearTimeout(t);
+  }, [job.stage, job.done]);
   return (
     <div className="progress" role="status" aria-live="polite">
       <div className="progress-text">
@@ -436,6 +454,7 @@ function ProgressOverlay({ job, onCancel }: { job: Progress; onCancel: () => voi
       </div>
       <div className={`track${det ? '' : ' indet'}`}><div className="fill" style={det ? { width: `${(job.done! / job.total!) * 100}%` } : undefined} /></div>
       <button className="btn small" onClick={onCancel}>Cancel</button>
+      {stalled && <p className="note caution" style={{ gridColumn: '1 / -1', margin: 0 }}>Still working on this step. Large photos with the deep model can take minutes on laptop GPUs; Cancel and choose Faithful or crop the photo for a faster result.</p>}
     </div>
   );
 }
@@ -476,6 +495,7 @@ function InfoSheet({ onClose, rt, server }: { onClose: () => void; rt: RtState; 
             </ul>
             <p className="note">This page can't call outside servers, so the server ships with its own copy of this app. {server ? `Connected: ${server.model}.` : 'Not connected here.'}</p>
             <p className="note">Engine: {rt.status === 'ready' ? `${rt.info.backend.toUpperCase()}, ${rt.info.tile} px tiles` : rt.status === 'loading' ? 'starting' : `unavailable (${rt.info.error ?? 'no WebGL'})`}.</p>
+            <Diagnostics rt={rt} />
           </div>
         </div>
       </div>
@@ -541,5 +561,20 @@ function ExportCard({ done, src }: { done: Done; src: Source }) {
       }}>Download {fmt.toUpperCase()}</button>
       {msg && <p className="note" role="status">{msg}</p>}
     </section>
+  );
+}
+
+function Diagnostics({ rt }: { rt: RtState }) {
+  const [shown, setShown] = useState(false);
+  const info = rt.status === 'loading' ? { status: 'loading' } : { status: rt.status, ...rt.info };
+  const text = JSON.stringify({ app: 'Lumen 1.1.3', ...info, ua: navigator.userAgent, dpr: window.devicePixelRatio, screen: [screen.width, screen.height] }, null, 1);
+  return (
+    <div className="field">
+      <button className="btn small" onClick={async () => {
+        setShown(true);
+        try { await navigator.clipboard.writeText(text); } catch { /* shown below for manual copy */ }
+      }}>Copy diagnostics</button>
+      {shown && <textarea id="diag" readOnly value={text} rows={6} style={{ width: '100%', fontFamily: 'var(--mono)', fontSize: 11 }} onFocus={(e) => e.currentTarget.select()} />}
+    </div>
   );
 }

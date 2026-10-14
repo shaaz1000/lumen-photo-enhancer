@@ -70,9 +70,21 @@ export interface Plan {
   color: number;
   faceRestore: number;
   notes: string[];
+  /** predicted reconstruction time in seconds on this device, when the speed was measured */
+  estSeconds?: number;
 }
 
-export interface Caps { deepOk: boolean; server: boolean; faceRestoreOk: boolean; /** phone or tablet running in the browser */ mobile?: boolean }
+export interface Caps {
+  deepOk: boolean; server: boolean; faceRestoreOk: boolean;
+  /** phone or tablet running in the browser */ mobile?: boolean;
+  /** measured fast-model seconds per input pixel, and tile overheads (browser only) */
+  secPerPx?: number; overhead?: { general: number; deep: number };
+}
+
+/** The deep model does about 14 times the arithmetic of the fast one per pixel. */
+export const DEEP_COST = 14;
+/** Longest run the app starts on its own; Maximum Detail ignores it. */
+export const AUTO_DEEP_SECONDS = 120;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -103,6 +115,20 @@ export function planFor(p: Params, mode: ModeId, a: Analysis | null, caps: Caps)
   if (f < 1) notes.push(`Processed at ${Math.round(f * 100)}% size first, because the image holds less detail than its pixel count. This lets the model reconstruct edges instead of enlarging blur.`);
 
   const fid = p.fidelity === 'faithful' ? 0 : p.fidelity === 'balanced' ? 1 : 2;
+  const estimate = (m: ModelKind, weak: boolean) => {
+    if (!caps.secPerPx || caps.server || !a) return undefined;
+    const n = a.w * a.h * f * f, ov = caps.overhead ?? { general: 1.5, deep: 2.8 };
+    return n * caps.secPerPx * ((m === 'deep' ? DEEP_COST * ov.deep : ov.general) + (weak ? ov.general : 0));
+  };
+  // Pick what this device can finish: a deep run predicted to take minutes is
+  // only started when Maximum Detail asks for it.
+  if (model === 'deep' && p.fidelity !== 'max') {
+    const t = estimate('deep', true);
+    if (t !== undefined && t > AUTO_DEEP_SECONDS) {
+      model = 'general';
+      notes.push(`The deep model would take about ${Math.round(t / 60)} min on this device, so the fast model is used. Choose Maximum Detail to run it anyway, or crop the photo.`);
+    }
+  }
   let textureMix = p.texture * [0.8, 0.5, 0.25][fid];
   if (model === 'deep') textureMix += (1 - p.denoise) * 0.3;
   textureMix = clamp(textureMix, 0, 0.8);
@@ -117,6 +143,7 @@ export function planFor(p: Params, mode: ModeId, a: Analysis | null, caps: Caps)
   if (faceRestore > 0) notes.push(`Generative face restoration at ${Math.round(faceRestore * 100)}%. Facial detail is partly inferred; likeness is kept as close as possible but is not guaranteed.`);
 
   return {
+    estSeconds: estimate(model, textureMix > 0.02),
     model, dni: p.denoise, preShrink: f, textureMix,
     // with generative restoration on, faces keep the restored detail instead of extra grain
     faceTextureBoost: faceRestore > 0 || skipWeak ? 0 : 0.25 * p.faceProtect, faceSharpenCut: 0.6 * p.faceProtect,

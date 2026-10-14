@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-15
+
+### Fixed
+
+* Enhance not starting in the web artifact. The legacy TensorFlow.js build evaluates code from strings, which a strict content security policy blocks, leaving TensorFlow.js half loaded (`setBackend is not a function`). The app now loads the ES2017 build, which needs no `eval`, and a test runs the app in a sandboxed iframe under such a policy.
+* Desktop runs that took many minutes with no sign of progress. The app measures this device's speed at start and only starts the deep model on its own when it should finish within about two minutes; Maximum Detail still forces it.
+
+### Added
+
+* Estimated time on this device, shown before each run.
+* A note in the progress card when a step runs long, with what to try instead.
+* Any unexpected error is shown on screen instead of failing silently.
+* Copy diagnostics (in What runs where) for bug reports.
+
 ## [1.1.2] - 2026-10-14
 
 ### Fixed

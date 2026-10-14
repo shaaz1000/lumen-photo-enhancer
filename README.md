@@ -5,9 +5,9 @@
 **Turn blurry screenshots, compressed Instagram saves and soft video frames into clearer, higher resolution photos.**
 Real-ESRGAN restoration running privately in your browser, with an optional server for generative face restoration.
 
-![version](https://img.shields.io/badge/version-1.1.2-2f5bd3)
+![version](https://img.shields.io/badge/version-1.1.3-2f5bd3)
 ![license](https://img.shields.io/badge/license-MIT-237a4b)
-![tests](https://img.shields.io/badge/tests-80%20passing-237a4b)
+![tests](https://img.shields.io/badge/tests-81%20passing-237a4b)
 ![privacy](https://img.shields.io/badge/images-never%20uploaded-6b7280)
 
 <img src="docs/benchmark/social_screenshot.png" alt="Crops of a degraded cat photo: input, bicubic, version 1.0, Faithful, Deep Restoration, Maximum Detail and the clean reference" width="860">
@@ -85,6 +85,7 @@ Timing above is ONNX Runtime on 2 CPU cores. In the browser the deep model runs 
 | | |
 |---|---|
 | **Two real models** | Real-ESRGAN x4plus (deep, 33 MB, downloaded on first use) and general v3 (fast, 2.4 MB) on WebGL |
+| **Speed aware** | Measures the device at start, shows the estimated time, and uses the deep model automatically only when it finishes in about two minutes |
 | **Reconstruction control** | Faithful, Balanced (default) or Maximum Detail |
 | **Deep Restoration mode** | Maximum clarity for soft, low resolution internet photos |
 | **Degradation aware** | Analysis estimates real detail, compression, noise, blur type and content, then picks mode, scale and detail matching |
@@ -245,10 +246,11 @@ curl -F image=@photo.jpg -F scale=2 -F model=deep http://localhost:8000/api/enha
 ## Testing
 
 ```sh
-npm test                         # 58 tests: models, pipeline, analysis, tiling, viewer maths
+npm test                         # 59 tests: models, pipeline, analysis, tiling, viewer maths
 npm run typecheck
 cd backend && pytest -q          # 22 tests: API, validation, rate limits, ONNX parity, real engine
-CHROME=/path/to/chrome npm run test:e2e   # real WebGL run of both models, slider, zoom, export
+CHROME=/path/to/chrome npm run test:e2e   # real WebGL run of both models, slider, zoom, export, crop
+CHROME=/path/to/chrome npm run test:csp   # runs inside a sandboxed iframe under a strict content security policy
 npm run bench                    # benchmark (see below)
 ```
 

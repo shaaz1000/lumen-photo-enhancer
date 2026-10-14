@@ -33,7 +33,7 @@ const base = `http://127.0.0.1:${server.address().port}/`;
 const vendor = {
   'react.production.min.js': join(root, 'node_modules/react/umd/react.production.min.js'),
   'react-dom.production.min.js': join(root, 'node_modules/react-dom/umd/react-dom.production.min.js'),
-  'tf.min.js': join(root, 'node_modules/@tensorflow/tfjs/dist/tf.min.js'),
+  'tf.es2017.min.js': join(root, 'node_modules/@tensorflow/tfjs/dist/tf.es2017.min.js'),
 };
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME, args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
@@ -116,7 +116,12 @@ check(f && /general v3/.test(f.report) && /Verified against the original/.test(f
 // 2. deep model through WebGL
 await pg.click('.modes >> text=Deep Restoration');
 await pg.click('[aria-label="Reconstruction strength"] >> text=Balanced');
-const d = await enhance('Deep Restoration (x4plus)');
+const est = await pg.locator('.inspector').textContent();
+check(/Estimated time on this device/.test(est), 'shows a time estimate before running');
+// software GL here is very slow, so Balanced should fall back to the fast model with a note
+check(/would take about \d+ min on this device/.test(est), 'slow device: Balanced explains why it uses the fast model');
+await pg.click('[aria-label="Reconstruction strength"] >> text=Maximum Detail');
+const d = await enhance('Deep Restoration, Maximum Detail (x4plus)');
 check(d && d.dims[1][0] === 240, 'Deep Restoration produced 240 × 160');
 check(d && /x4plus/.test(d.report) && /GPU \(WebGL\)/.test(d.report), 'report names x4plus running on WebGL');
 await pg.waitForTimeout(1200);

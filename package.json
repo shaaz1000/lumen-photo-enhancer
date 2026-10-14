@@ -1,6 +1,6 @@
 {
   "name": "lumen-photo-enhancer",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "AI photo enhancer and upscaler: Real-ESRGAN in the browser plus an optional FastAPI server",
   "scripts": {
     "build": "node build.mjs",
@@ -8,7 +8,8 @@
     "test:e2e": "node tests/e2e/smoke.mjs",
     "typecheck": "tsc --noEmit",
     "weights": "python3 tools/convert_weights.py",
-    "bench": "node bench/build.mjs && node bench/.build/run.mjs"
+    "bench": "node bench/build.mjs && node bench/.build/run.mjs",
+    "test:csp": "node tests/e2e/csp_probe.mjs"
   },
   "author": "",
   "license": "MIT",

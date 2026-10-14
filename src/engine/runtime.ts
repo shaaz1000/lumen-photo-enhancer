@@ -9,7 +9,14 @@ import * as faceapi from '@vladmandic/face-api/dist/face-api.esm-nobundle.js';
 
 declare global { interface Window { tf: Tf } }
 
-export interface RuntimeInfo { backend: string; gpu: boolean; mobile: boolean; tile: number; deepOk: boolean; error?: string }
+export interface RuntimeInfo {
+  backend: string; gpu: boolean; mobile: boolean; tile: number; deepOk: boolean; error?: string;
+  /** measured seconds per input pixel for the fast model, without tile overhead */
+  secPerPx?: number;
+  /** extra work from tile context, per model */
+  overhead?: { general: number; deep: number };
+  renderer?: string;
+}
 
 const MODEL_BASE = './models/';
 // Artifact hosting serves only web file types, so the raw weight files carry a .wasm extension.
@@ -94,7 +101,27 @@ export async function initRuntime(): Promise<{ rt: Runtime | null; info: Runtime
       return keep(key, guard(buildSrvgg(tf, blendWeights(strong, weak, Math.round(dni * 20) / 20))));
     },
   };
-  return { rt, info: { backend, gpu, mobile, tile: tiles.general, deepOk: gpu } };
+  // Speed probe: one warm-up and one timed run of the fast model on a 64 px tile.
+  // The deep model does about 14 times the arithmetic per pixel, so this predicts
+  // both run times well enough to pick a model the device can finish in reasonable time.
+  let secPerPx: number | undefined;
+  try {
+    const m = await rt.getModel('general', 0.5);
+    const probe = new Float32Array(64 * 64 * 3).fill(0.5);
+    await m.infer(probe, 64, 64);
+    const t0 = performance.now();
+    await m.infer(probe, 64, 64);
+    secPerPx = (performance.now() - t0) / 1000 / (64 * 64);
+  } catch { /* leave unknown */ }
+  const ov = (t: number, extra: number) => ((t + 2 * extra) / t) ** 2;
+  let renderer: string | undefined;
+  try {
+    const gl = (tf.backend() as any).gpgpu?.gl as WebGLRenderingContext | undefined;
+    const ext = gl?.getExtension('WEBGL_debug_renderer_info');
+    renderer = ext ? String(gl!.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : undefined;
+  } catch { /* hidden */ }
+  return { rt, info: { backend, gpu, mobile, tile: tiles.general, deepOk: gpu, secPerPx, renderer,
+    overhead: { general: ov(tiles.general, 16 + 8), deep: ov(tiles.deep, 32 + 12) } } };
 }
 
 let faceReady: Promise<boolean> | null = null;
